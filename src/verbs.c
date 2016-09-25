@@ -707,10 +707,10 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 		if (check_peer_direct(mctx, attr->peer_direct_attrs,
 				      MLX5_DBG_CQ,
 				      IBV_EXP_PEER_OP_STORE_DWORD_CAP |
-				      IBV_EXP_PEER_OP_POLL_AND_DWORD_CAP) &&
-		    attr->peer_direct_attrs->caps &
+				      IBV_EXP_PEER_OP_POLL_AND_DWORD_CAP) ||
+		    !(attr->peer_direct_attrs->caps &
 				     (IBV_EXP_PEER_OP_POLL_NOR_DWORD_CAP |
-				      IBV_EXP_PEER_OP_POLL_GEQ_DWORD_CAP)) {
+				      IBV_EXP_PEER_OP_POLL_GEQ_DWORD_CAP))) {
 			goto err_spl;
 		}
 		cq->peer_enabled = 1;

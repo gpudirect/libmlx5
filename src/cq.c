@@ -1078,6 +1078,7 @@ int mlx5_exp_peer_peek_cq(struct ibv_cq *ibcq,
 			return E2BIG;
 		}
 		n = peek_ctx->offset;
+		break;
 	case IBV_EXP_PEER_PEEK_RELATIVE:
 		if (peek_ctx->offset > cq->ibv_cq.cqe) {
 			mlx5_unlock(&cq->lock);

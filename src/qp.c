@@ -1773,7 +1773,7 @@ int mlx5_exp_peer_commit_qp(struct ibv_qp *ibqp,
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	struct peer_op_wr *wr = commit_ctx->storage;
-	int entries = 4;
+	int entries = 3;
 
 	if (!qp->peer_enabled)
 		return -EINVAL;
