@@ -18,7 +18,7 @@ Url: http://openfabrics.org/
 Source: http://openfabrics.org/downloads/mlx5/%{name}-%{version}.tar.gz
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
-BuildRequires: libibverbs-devel >= 1.1-0.1.rc2
+BuildRequires: libibverbs-devel >= 1.1.8
 %if %{_with_valgrind}
 BuildRequires: valgrind-devel
 %endif
