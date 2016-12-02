@@ -1809,7 +1809,12 @@ int mlx5_exp_peer_commit_qp(struct ibv_qp *ibqp,
 	wr->type = IBV_EXP_PEER_OP_STORE_QWORD;
 	wr->wr.qword_va.data = *(__be64 *)qp->peer_ctrl_seg;
 	wr->wr.qword_va.target_id = qp->peer_va_ids[MLX5_QP_PEER_VA_ID_BF];
-	wr->wr.qword_va.offset = 0;
+	wr->wr.qword_va.offset = qp->gen_data.bf->offset;
+	/* save bf->offset rollback info */
+	if (commit_ctx->rollback_id & (1ULL<<63))
+		return -EINVAL;
+	commit_ctx->rollback_id ^= qp->gen_data.bf->offset ? (1ULL << 63) : 0;
+	qp->gen_data.bf->offset ^= qp->gen_data.bf->buf_size;
 
 	qp->peer_ctrl_seg = NULL;
 	commit_ctx->entries = entries;
@@ -1822,6 +1827,9 @@ int mlx5_exp_rollback_send(struct ibv_qp *ibqp,
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	int diff;
+
+	qp->gen_data.bf->offset = (rollback->rollback_id & (1ULL << 63)) ? qp->gen_data.bf->buf_size : 0;
+	rollback->rollback_id &= (1ULL << 63) - 1;
 
 	if (rollback->flags & IBV_EXP_ROLLBACK_ABORT_UNCOMMITED) {
 		diff = (qp->gen_data.scur_post & 0xffff)
