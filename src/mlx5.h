@@ -824,6 +824,7 @@ struct mlx5_qp {
 	int					peer_enabled;
 	struct ibv_exp_peer_direct_attr	       *peer_ctx;
 	void				       *peer_ctrl_seg;
+	int					peer_seg_size;
 	uint32_t				peer_scur_post;
 	uint64_t				peer_va_ids[MLX5_QP_PEER_VA_ID_MAX];
 	struct ibv_exp_peer_buf		       *peer_db_buf;

@@ -1753,8 +1753,10 @@ out:
 					& CREATE_FLAG_NO_DOORBELL)) {
 			/* Controlled or peer-direct qp */
 			wmb();
-			if (qp->peer_enabled)
+			if (qp->peer_enabled) {
 				qp->peer_ctrl_seg = wqe2ring;
+				qp->peer_seg_size = (size + 3 ) / 4;
+                        }
 			goto post_send_no_db;
 		}
 
@@ -1806,10 +1808,23 @@ int mlx5_exp_peer_commit_qp(struct ibv_qp *ibqp,
 		wr->wr.fence.fence_flags |= IBV_EXP_PEER_FENCE_MEM_SYS;
 	wr = wr->next;
 
-	wr->type = IBV_EXP_PEER_OP_STORE_QWORD;
-	wr->wr.qword_va.data = *(__be64 *)qp->peer_ctrl_seg;
-	wr->wr.qword_va.target_id = qp->peer_va_ids[MLX5_QP_PEER_VA_ID_BF];
-	wr->wr.qword_va.offset = qp->gen_data.bf->offset;
+	int no_lock_needed = (qp->gen_data.bf->db_method == MLX5_DB_METHOD_DEDIC_BF_1_THREAD) ||
+		(qp->gen_data.bf->db_method == MLX5_DB_METHOD_DEDIC_BF);
+	int can_inline = (qp->peer_seg_size <= qp->gen_data.bf->buf_size / 64);
+	// TODO: check that copy is not crossing the end of the WQ
+	if ((qp->peer_ctx->caps & IBV_EXP_PEER_OP_COPY_BLOCK_CAP) && no_lock_needed && can_inline) {
+		wr->type = IBV_EXP_PEER_OP_COPY_BLOCK;
+		wr->wr.copy_op.src = (__be64 *)qp->peer_ctrl_seg;
+		wr->wr.copy_op.target_id = qp->peer_va_ids[MLX5_QP_PEER_VA_ID_BF];
+		wr->wr.copy_op.offset = qp->gen_data.bf->offset;
+		wr->wr.copy_op.len = qp->peer_seg_size * 64;
+	} else {
+		wr->type = IBV_EXP_PEER_OP_STORE_QWORD;
+		wr->wr.qword_va.data = *(__be64 *)qp->peer_ctrl_seg;
+		wr->wr.qword_va.target_id = qp->peer_va_ids[MLX5_QP_PEER_VA_ID_BF];
+		wr->wr.qword_va.offset = qp->gen_data.bf->offset;
+	}
+
 	/* save bf->offset rollback info */
 	if (commit_ctx->rollback_id & (1ULL<<63))
 		return -EINVAL;
