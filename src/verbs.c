@@ -2110,6 +2110,12 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		qp->peer_enabled = 1;
 		qp->peer_ctx = attrx->peer_direct_attrs;
 		qp->gen_data.create_flags |= CREATE_FLAG_NO_DOORBELL;
+		/* used by mlx5_alloc_qp_buf below */
+		if (qp->peer_ctx->buf_alloc) {
+			qp->buf.peer.dir = IBV_EXP_PEER_DIRECTION_FROM_PEER |
+				IBV_EXP_PEER_DIRECTION_TO_HCA;
+			qp->buf.peer.ctx = qp->peer_ctx;
+		}
 	}
 
 	if (mlx5_alloc_qp_buf(context, attrx, qp, ret)) {
