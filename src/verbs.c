@@ -728,10 +728,35 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 		goto err_buf;
 	}
 
-	cq->dbrec  = mlx5_alloc_dbrec(mctx);
+	if (cq->peer_enabled && cq->peer_ctx->buf_alloc) {
+		struct ibv_exp_peer_buf_alloc_attr attr;
+
+		attr.length = mctx->cache_line_size;
+		attr.peer_id = cq->peer_ctx->peer_id;
+		attr.dir = IBV_EXP_PEER_DIRECTION_FROM_PEER |
+			IBV_EXP_PEER_DIRECTION_TO_HCA;
+		attr.alignment = mctx->cache_line_size;
+		cq->peer_dbrec_buf = cq->peer_ctx->buf_alloc(&attr);
+		if (cq->peer_dbrec_buf)
+			cq->dbrec = cq->peer_dbrec_buf->addr;
+	}
+	if (!cq->dbrec)
+		cq->dbrec = mlx5_alloc_dbrec(mctx);
 	if (!cq->dbrec) {
 		mlx5_dbg(fp, MLX5_DBG_CQ, "\n");
 		goto err_peer_buf;
+	}
+
+	if (cq->peer_enabled && cq->peer_ctx->register_va) {
+		cq->peer_dbrec_id =
+			cq->peer_ctx->register_va((void*)cq->dbrec,
+						  mctx->cache_line_size,
+						  cq->peer_ctx->peer_id,
+						  cq->peer_dbrec_buf);
+		if (!cq->peer_dbrec_id) {
+			mlx5_dbg(fp, MLX5_DBG_QP, "\n");
+			goto err_peer_buf;
+		}
 	}
 
 	cq->dbrec[MLX5_CQ_SET_CI]	= 0;
@@ -811,8 +836,14 @@ err_db:
 	mlx5_free_db(mctx, cq->dbrec);
 
 err_peer_buf:
-	if (cq->peer_enabled)
+	if (cq->peer_enabled) {
 		mlx5_free_actual_buf(mctx, &cq->peer_buf);
+		if (cq->peer_dbrec_buf) {
+			if (cq->peer_dbrec_id)
+				cq->peer_ctx->unregister_va(cq->peer_dbrec_id, cq->peer_ctx->peer_id);
+			cq->peer_ctx->buf_release(cq->peer_dbrec_buf);
+		}
+	}
 
 err_buf:
 	mlx5_free_actual_buf(mctx, &cq->buf_a);
@@ -935,8 +966,15 @@ int mlx5_destroy_cq(struct ibv_cq *ibcq)
 
 	mlx5_free_db(ctx, cq->dbrec);
 	mlx5_free_actual_buf(ctx, cq->active_buf);
-	if (cq->peer_enabled)
+	if (cq->peer_enabled) {
 		mlx5_free_actual_buf(ctx, &cq->peer_buf);
+		if (cq->peer_dbrec_buf) {
+			if (cq->peer_dbrec_id)
+				cq->peer_ctx->unregister_va(cq->peer_dbrec_id, cq->peer_ctx->peer_id);
+			cq->peer_ctx->buf_release(cq->peer_dbrec_buf);
+		}
+	}
+
 	free(cq);
 
 	return 0;

@@ -626,6 +626,8 @@ struct mlx5_cq {
 	struct mlx5_buf				peer_buf;
 	struct mlx5_peek_entry		      **peer_peek_table;
 	struct mlx5_peek_entry		       *peer_peek_free;
+	struct ibv_exp_peer_buf                *peer_dbrec_buf;
+	uint64_t                                peer_dbrec_id;
 };
 
 struct mlx5_srq {
