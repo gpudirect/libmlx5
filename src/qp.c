@@ -339,6 +339,7 @@ void mlx5_init_qp_indices(struct mlx5_qp *qp)
 	qp->rq_enable.head_en_count = 0;
 	qp->peer_scur_post = 0;
 	qp->peer_ctrl_seg  = NULL;
+        qp->peer_seg_size  = 0;
 }
 
 void mlx5_init_rwq_indices(struct mlx5_rwq *rwq)
@@ -2056,7 +2057,7 @@ out:
 			wmb();
 			if (qp->peer_enabled) {
 				qp->peer_ctrl_seg = wqe2ring;
-				qp->peer_seg_size = (size + 3 ) / 4;
+				qp->peer_seg_size += (size + 3 ) / 4;
                         }
 			goto post_send_no_db;
 		}
@@ -2133,6 +2134,7 @@ int mlx5_exp_peer_commit_qp(struct ibv_qp *ibqp,
 	qp->gen_data.bf->offset ^= qp->gen_data.bf->buf_size;
 
 	qp->peer_ctrl_seg = NULL;
+	qp->peer_seg_size = 0;
 	commit_ctx->entries = entries;
 
 	return 0;
