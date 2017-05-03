@@ -52,6 +52,7 @@
 
 #define MLX5_CHUNK_SIZE(calc)	64 * (1 << calc->log_chunk_size)
 #define MLX5_EC_NOUTPUTS(m)	(m == 3 ? 4 : m)
+#define EC_BEACON_WRID		0xfffffffffffffffeULL
 
 struct mlx5_ec_mat {
 	struct ibv_sge		sge;
@@ -98,8 +99,11 @@ struct mlx5_ec_calc {
 	struct ibv_mr		*dump_mr;
 	int			k;
 	int			m;
+	int			w;
 	int			max_inflight_calcs;
 	int			polling;
+	pthread_mutex_t         beacon_mutex;
+	pthread_cond_t          beacon_cond;
 };
 
 static inline struct mlx5_ec_calc *to_mcalc(struct ibv_exp_ec_calc *ec_calc)

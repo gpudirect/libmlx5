@@ -170,6 +170,12 @@ enum {
 	MLX5_EXP_IB_MMAP_N_ALLOC_WC_CMD			= 0xFE,
 };
 
+enum {
+	MLX5_CQE_VERSION_V0	= 0,
+	MLX5_CQE_VERSION_V1	= 1,
+};
+
+
 #define MLX5_CQ_PREFIX "MLX_CQ"
 #define MLX5_QP_PREFIX "MLX_QP"
 #define MLX5_MR_PREFIX "MLX_MR"
@@ -259,7 +265,6 @@ enum {
 	MLX5_OPCODE_ATOMIC_FA		= 0x12,
 	MLX5_OPCODE_ATOMIC_MASKED_CS	= 0x14,
 	MLX5_OPCODE_ATOMIC_MASKED_FA	= 0x15,
-	MLX5_OPCODE_BIND_MW		= 0x18,
 	MLX5_OPCODE_FMR			= 0x19,
 	MLX5_OPCODE_LOCAL_INVAL		= 0x1b,
 	MLX5_OPCODE_CONFIG_CMD		= 0x1f,
@@ -326,6 +331,10 @@ enum mlx5_rsc_type {
 	MLX5_RSC_TYPE_INVAL,
 };
 
+enum {
+	MLX5_USER_CMDS_SUPP_UHW_CREATE_AH    = 1 << 1,
+};
+
 struct mlx5_resource {
 	enum mlx5_rsc_type	type;
 	uint32_t		rsn;
@@ -349,6 +358,7 @@ struct mlx5_atomic_info {
 	int			valid;
 	enum ibv_exp_atomic_cap	exp_atomic_cap;
 	uint64_t	bit_mask_log_atomic_arg_sizes;
+	uint64_t	masked_log_atomic_arg_sizes_network_endianness;
 };
 
 enum mlx5_uar_mapping_type {
@@ -454,6 +464,7 @@ struct mlx5_context {
 	} core_clock;
 	void			       *hca_core_clock;
 	uint32_t			max_tso;
+	int				cmds_supp_uhw;
 };
 
 struct mlx5_bitmap {
@@ -666,6 +677,7 @@ struct mlx5_wq {
 	volatile uint32_t	       *db;
 	int				wqe_shift;
 	int				offset;
+	uint32_t			*wr_data;
 };
 
 struct mlx5_wq_recv_send_enable {
@@ -888,6 +900,7 @@ struct mlx5_rwq {
 struct mlx5_ah {
 	struct ibv_ah			ibv_ah;
 	struct mlx5_wqe_av		av;
+	int				kern_ah;
 };
 
 struct mlx5_verbs_srq {
@@ -1091,6 +1104,10 @@ int mlx5_prefetch_mr(struct ibv_mr *mr, struct ibv_exp_prefetch_attr *attr);
 
 int mlx5_query_device(struct ibv_context *context,
 		       struct ibv_device_attr *attr);
+int mlx5_query_device_ex(struct ibv_context *context,
+			 const struct ibv_query_device_ex_input *input,
+			 struct ibv_device_attr_ex *attr,
+			 size_t attr_size);
 int mlx5_query_port(struct ibv_context *context, uint8_t port,
 		     struct ibv_port_attr *attr);
 int mlx5_exp_query_port(struct ibv_context *context, uint8_t port_num,
@@ -1102,8 +1119,14 @@ void read_init_vars(struct mlx5_context *ctx);
 
 struct ibv_mr *mlx5_reg_mr(struct ibv_pd *pd, void *addr,
 			   size_t length, int access);
+int mlx5_rereg_mr(struct ibv_mr *mr, int flags, struct ibv_pd *pd, void *addr,
+		  size_t length, int access);
 struct ibv_mr *mlx5_exp_reg_mr(struct ibv_exp_reg_mr_in *in);
 int mlx5_dereg_mr(struct ibv_mr *mr);
+struct ibv_mw *mlx5_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type);
+int mlx5_dealloc_mw(struct ibv_mw *mw);
+int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
+		 struct ibv_mw_bind *mw_bind);
 
 struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 			       struct ibv_comp_channel *channel,
@@ -1201,6 +1224,8 @@ struct ibv_qp *mlx5_exp_create_qp(struct ibv_context *context,
 				  struct ibv_exp_qp_init_attr *attrx);
 struct ibv_ah *mlx5_exp_create_ah(struct ibv_pd *pd,
 				  struct ibv_exp_ah_attr *attr_ex);
+struct ibv_ah *mlx5_exp_create_kah(struct ibv_pd *pd,
+				   struct ibv_exp_ah_attr *attr_ex);
 struct ibv_xrcd	*mlx5_open_xrcd(struct ibv_context *context,
 				struct ibv_xrcd_init_attr *xrcd_init_attr);
 struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
@@ -1213,7 +1238,7 @@ int mlx5_modify_qp_ex(struct ibv_qp *qp, struct ibv_exp_qp_attr *attr,
 		      uint64_t attr_mask);
 void *mlx5_get_legacy_xrc(struct ibv_srq *srq);
 void mlx5_set_legacy_xrc(struct ibv_srq *srq, void *legacy_xrc_srq);
-int mlx5_query_device_ex(struct ibv_context *context,
+int mlx5_exp_query_device(struct ibv_context *context,
 			 struct ibv_exp_device_attr *attr);
 int mlx5_exp_query_values(struct ibv_context *context, int q_values,
 			  struct ibv_exp_values *values);
@@ -1275,7 +1300,9 @@ static inline int mlx5_spin_lock(struct mlx5_spinlock *lock)
 	if (unlikely(lock->state == MLX5_LOCKED)) {
 		fprintf(stderr, "*** ERROR: multithreading violation ***\n"
 			"You are running a multithreaded application but\n"
-			"you set MLX5_SINGLE_THREADED=1. Please unset it.\n");
+			"you set MLX5_SINGLE_THREADED=1 or created a\n"
+			"resource domain thread-model which is not safe.\n"
+			"Please fix it.\n");
 		abort();
 	} else {
 		lock->state = MLX5_LOCKED;
@@ -1326,7 +1353,9 @@ static inline int mlx5_lock(struct mlx5_lock *lock)
 	if (unlikely(lock->state == MLX5_LOCKED)) {
 		fprintf(stderr, "*** ERROR: multithreading violation ***\n"
 			"You are running a multithreaded application but\n"
-			"you set MLX5_SINGLE_THREADED=1. Please unset it.\n");
+			"you set MLX5_SINGLE_THREADED=1 or created a\n"
+			"resource domain thread-model which is not safe.\n"
+			"Please fix it.\n");
 		abort();
 	} else {
 		lock->state = MLX5_LOCKED;

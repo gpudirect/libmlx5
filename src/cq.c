@@ -230,7 +230,7 @@ static inline struct mlx5_cqe64 *get_next_cqe(struct mlx5_cq *cq, const int cqe_
 	return NULL;
 }
 
-static void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe)
+static inline void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe, struct mlx5_wq *wq, int idx)
 {
 	switch (ntohl(cqe->sop_drop_qpn) >> 24) {
 	case MLX5_OPCODE_RDMA_WRITE_IMM:
@@ -256,19 +256,18 @@ static void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe)
 		wc->opcode    = IBV_WC_FETCH_ADD;
 		wc->byte_len  = 8;
 		break;
-	case MLX5_OPCODE_BIND_MW:
-		wc->opcode    = IBV_WC_BIND_MW;
-		break;
 	case MLX5_OPCODE_UMR:
-		wc->opcode    = IBV_EXP_WC_UMR;
+		wc->opcode    = wq->wr_data[idx];
 		break;
 
 	case MLX5_OPCODE_ATOMIC_MASKED_CS:
 		wc->opcode    = IBV_EXP_WC_MASKED_COMP_SWAP;
+		wc->byte_len  = ntohl(cqe->byte_cnt);
 		break;
 
 	case MLX5_OPCODE_ATOMIC_MASKED_FA:
 		wc->opcode    = IBV_EXP_WC_MASKED_FETCH_ADD;
+		wc->byte_len  = ntohl(cqe->byte_cnt);
 		break;
 	case MLX5_OPCODE_TSO:
 		wc->opcode    = IBV_EXP_WC_TSO;
@@ -331,7 +330,7 @@ static inline int handle_responder(struct ibv_wc *wc, struct mlx5_cqe64 *cqe,
 		break;
 	case MLX5_CQE_RESP_SEND_INV:
 		wc->opcode = IBV_WC_RECV;
-		*exp_wc_flags |= IBV_EXP_WC_WITH_INV;
+		wc->wc_flags	|= IBV_WC_WITH_INV;
 		wc->imm_data = ntohl(cqe->imm_inval_pkey);
 		break;
 	}
@@ -371,7 +370,8 @@ static void dump_cqe(FILE *fp, void *buf)
 
 static void mlx5_set_bad_wc_opcode(struct ibv_exp_wc *wc,
 				   struct mlx5_err_cqe *cqe,
-				   uint8_t is_req)
+				   uint8_t is_req,
+				   uint8_t *is_umr)
 {
 	if (is_req) {
 		switch (ntohl(cqe->s_wqe_opcode_qpn) >> 24) {
@@ -393,11 +393,8 @@ static void mlx5_set_bad_wc_opcode(struct ibv_exp_wc *wc,
 		case MLX5_OPCODE_ATOMIC_FA:
 			wc->exp_opcode    = IBV_EXP_WC_FETCH_ADD;
 			break;
-		case MLX5_OPCODE_BIND_MW:
-			wc->exp_opcode    = IBV_EXP_WC_BIND_MW;
-			break;
 		case MLX5_OPCODE_UMR:
-			wc->exp_opcode    = IBV_EXP_WC_UMR;
+			*is_umr = 1;
 			break;
 		case MLX5_OPCODE_ATOMIC_MASKED_CS:
 			wc->exp_opcode    = IBV_EXP_WC_MASKED_COMP_SWAP;
@@ -955,7 +952,7 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 		wq = &mqp->sq;
 		wqe_ctr = ntohs(cqe64->wqe_counter);
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
-		handle_good_req((struct ibv_wc *)wc, cqe64);
+		handle_good_req((struct ibv_wc *)wc, cqe64, wq, idx);
 		if (cqe_format == MLX5_INLINE_DATA32_SEG) {
 			cqe = cqe64;
 			err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe,
@@ -997,9 +994,11 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 		break;
 	case MLX5_CQE_REQ_ERR:
 	case MLX5_CQE_RESP_ERR:
+		{
+		uint8_t is_umr = 0;
 		ecqe = (struct mlx5_err_cqe *)cqe64;
 		mlx5_handle_error_cqe(ecqe, wc);
-		mlx5_set_bad_wc_opcode(wc, ecqe, (opcode == MLX5_CQE_REQ_ERR));
+		mlx5_set_bad_wc_opcode(wc, ecqe, (opcode == MLX5_CQE_REQ_ERR), &is_umr);
 		if (unlikely(ecqe->syndrome != MLX5_CQE_SYNDROME_WR_FLUSH_ERR &&
 			     ecqe->syndrome != MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR)) {
 			FILE *fp = mctx->dbg_fp;
@@ -1019,6 +1018,8 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
 			wc->wr_id = wq->wrid[idx];
 			wq->tail = mqp->gen_data.wqe_head[idx] + 1;
+			if (is_umr)
+				wc->exp_opcode = wq->wr_data[idx];
 		} else {
 			if (*cur_srq) {
 				wqe_ctr = ntohs(cqe64->wqe_counter);
@@ -1034,6 +1035,7 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 			}
 		}
 		break;
+		}
 	}
 
 	if (unlikely(timestamp_en)) {

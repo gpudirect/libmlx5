@@ -86,6 +86,7 @@ struct {
 	HCA(MELLANOX, 4119),	/* ConnectX-5, PCIe 3.0 */
 	HCA(MELLANOX, 4120),	/* ConnectX-5 VF */
 	HCA(MELLANOX, 4121),	/* ConnectX-5, PCIe 4.0 */
+	HCA(MELLANOX, 4122),	/* ConnectX-5, PCIe 4.0 VF */
 };
 
 uint32_t mlx5_debug_mask = 0;
@@ -97,7 +98,11 @@ static struct ibv_context_ops mlx5_ctx_ops = {
 	.alloc_pd      = mlx5_alloc_pd,
 	.dealloc_pd    = mlx5_free_pd,
 	.reg_mr	       = mlx5_reg_mr,
+	.rereg_mr      = mlx5_rereg_mr,
 	.dereg_mr      = mlx5_dereg_mr,
+	.alloc_mw      = mlx5_alloc_mw,
+	.dealloc_mw    = mlx5_dealloc_mw,
+	.bind_mw       = mlx5_bind_mw,
 	.create_cq     = mlx5_create_cq,
 	.poll_cq       = mlx5_poll_cq,
 	.req_notify_cq = mlx5_arm_cq,
@@ -580,6 +585,8 @@ static void set_extended(struct verbs_context *verbs_ctx)
 
 	if (sizeof(*verbs_ctx) - off_destroy_flow <= verbs_ctx->sz)
 		verbs_ctx->destroy_flow = ibv_cmd_destroy_flow;
+
+	verbs_set_ctx_op(verbs_ctx, query_device_ex, mlx5_query_device_ex);
 }
 
 static void set_experimental(struct ibv_context *ctx)
@@ -591,7 +598,7 @@ static void set_experimental(struct ibv_context *ctx)
 	verbs_set_exp_ctx_op(verbs_exp_ctx, destroy_dct, mlx5_destroy_dct);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, query_dct, mlx5_query_dct);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_arm_dct, mlx5_arm_dct);
-	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_device, mlx5_query_device_ex);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_device, mlx5_exp_query_device);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_create_qp, mlx5_exp_create_qp);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_modify_qp, mlx5_modify_qp_ex);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_get_legacy_xrc, mlx5_get_legacy_xrc);
@@ -623,6 +630,7 @@ static void set_experimental(struct ibv_context *ctx)
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_release_intf, mlx5_exp_release_intf);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_port, mlx5_exp_query_port);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_ibv_create_ah, mlx5_exp_create_ah);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_ibv_create_kah, mlx5_exp_create_kah);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_values, mlx5_exp_query_values);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, alloc_ec_calc, mlx5_alloc_ec_calc);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, dealloc_ec_calc, mlx5_dealloc_ec_calc);
@@ -721,6 +729,7 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	int	uar_mapped;
 	off_t	offset;
 	int	err;
+	int	legacy_uar_map = 0;
 
 	context = to_mctx(ctx);
 	if (pthread_mutex_init(&context->env_mtx, NULL))
@@ -747,8 +756,10 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	}
 
 	memset(&req, 0, sizeof(req));
+
 	req.total_num_uuars = tot_uuars;
 	req.num_low_latency_uuars = low_lat_uuars;
+	req.cqe_version = MLX5_CQE_VERSION_V1;
 	if (ibv_cmd_get_context(&context->ibv_ctx, &req.ibv_req, sizeof req,
 				&resp.ibv_resp, sizeof resp))
 		goto err_free_bf;
@@ -764,9 +775,11 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	context->num_ports	= resp.num_ports;
 	context->max_recv_wr	= resp.max_recv_wr;
 	context->max_srq_recv_wr = resp.max_srq_recv_wr;
-	context->max_desc_sz_sq_dc = resp.max_desc_sz_sq_dc;
-	context->atomic_sizes_dc = resp.atomic_sizes_dc;
-	context->compact_av = resp.flags & MLX5_CAP_COMPACT_AV;
+
+	context->cmds_supp_uhw = resp.cmds_supp_uhw;
+
+	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_FLAGS)
+		context->compact_av = resp.exp_data.flags & MLX5_CAP_COMPACT_AV;
 
 	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_CQE_COMP_MAX_NUM)
 		context->cqe_comp_max_num = resp.exp_data.cqe_comp_max_num;
@@ -780,7 +793,14 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_RROCE_UDP_SPORT_MAX)
 		context->rroce_udp_sport_max = resp.exp_data.rroce_udp_sport_max;
 
+	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_MAX_DESC_SZ_SQ_DC)
+		context->max_desc_sz_sq_dc = resp.exp_data.max_desc_sz_sq_dc;
+
+	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_ATOMIC_SIZES_DC)
+		context->atomic_sizes_dc = resp.exp_data.atomic_sizes_dc;
+
 	ctx->ops = mlx5_ctx_ops;
+	context->cqe_version = resp.cqe_version;
 	if (context->cqe_version) {
 		if (context->cqe_version == 1) {
 			ctx->ops.poll_cq = mlx5_poll_cq_1;
@@ -792,7 +812,7 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	}
 
 	attr.comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1;
-	err = mlx5_query_device_ex(ctx, &attr);
+	err = mlx5_exp_query_device(ctx, &attr);
 	if (!err) {
 		if (attr.comp_mask & IBV_EXP_DEVICE_ATTR_EXP_CAP_FLAGS)
 			context->exp_device_cap_flags = attr.exp_device_cap_flags;
@@ -873,6 +893,7 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 			context->uar[i].regs = mlx5_uar_mmap(i, MLX5_MMAP_GET_REGULAR_PAGES_CMD, page_size, cmd_fd);
 			if (context->uar[i].regs != MAP_FAILED) {
 				context->uar[i].map_type = MLX5_UAR_MAP_WC;
+				legacy_uar_map = 1;
 				uar_mapped = 1;
 			}
 		}
@@ -893,7 +914,12 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 			       mlx5_get_locktype());
 		context->bfs[j].offset = 0;
 		if (context->uar[j / 4].map_type == MLX5_UAR_MAP_WC) {
-			context->bfs[j].buf_size = context->bf_reg_size / 2;
+			/* In case of legacy mapping we don't know if UAR
+			 * mapped as NC or WC. To be on the safe side we assume
+			 * mapping as WC but BF buf_size = 0 this will force DB
+			 * on WC memory.
+			 */
+			context->bfs[j].buf_size = legacy_uar_map ? 0 : context->bf_reg_size / 2;
 			context->bfs[j].db_method = (context->bfs[j].need_lock &&  !mlx5_single_threaded) ?
 						    MLX5_DB_METHOD_BF :
 						    (mlx5_single_threaded && wc_auto_evict_size() == 64 ?
@@ -980,6 +1006,13 @@ static void mlx5_free_context(struct verbs_device *device,
 	close_debug_file(context);
 }
 
+static void mlx5_driver_uninit(struct verbs_device *verbs_device)
+{
+	struct mlx5_device *mlx5_dev = to_mdev(&verbs_device->device);
+
+	free(mlx5_dev);
+}
+
 static struct verbs_device *mlx5_driver_init(const char *uverbs_sys_path,
 					     int abi_version)
 {
@@ -1037,6 +1070,7 @@ found:
 	 */
 	dev->verbs_dev.init_context = mlx5_alloc_context;
 	dev->verbs_dev.uninit_context = mlx5_free_context;
+	dev->verbs_dev.verbs_uninit_func = mlx5_driver_uninit;
 
 	return &dev->verbs_dev;
 }

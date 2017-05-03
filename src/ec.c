@@ -34,6 +34,10 @@
 #include "ec.h"
 #include "doorbell.h"
 
+static int ec_post_recv(struct ibv_qp *qp,
+			struct ibv_sge *sge,
+			struct mlx5_ec_comp *comp);
+
 static struct mlx5_ec_mat *
 mlx5_get_ec_decode_mat(struct mlx5_ec_calc *calc,
 		       uint8_t *decode_matrix,
@@ -51,11 +55,14 @@ mlx5_get_ec_decode_mat(struct mlx5_ec_calc *calc,
 	mlx5_unlock(&pool->lock);
 
 	buf = (uint8_t *)(uintptr_t)decode->sge.addr;
-	for (i = 0; i < k; i++)
-		for (j = 0; j < cols; j++)
-			/* Crazy HW formatting, bit 5 is on */
-			buf[i*cols+j] = decode_matrix[i*m+j] | 0x10;
-
+	for (i = 0; i < k; i++) {
+		for (j = 0; j < cols; j++) {
+			buf[i * cols + j] = decode_matrix[i * m + j];
+			if (calc->w != 8)
+				/* Crazy HW formatting, bit 5 is on */
+				buf[i * cols + j] |= 0x10;
+		}
+	}
 	/* Three outputs, zero the last column */
 	if (m == 3)
 		for (i = 0; i < k; i++)
@@ -95,12 +102,17 @@ mlx5_get_ec_update_mat(struct mlx5_ec_calc *calc,
 	/* We first constract identity matrix */
 	for (uraw = 0; uraw < m; uraw++) {
 		for (ucol = 0; ucol < m; ucol++) {
-			if (uraw == ucol)
-			 /* Crazy HW formatting, bit 5 is on */
-				update_mat[uraw * cols + ucol] = 1 | 0x10;
-			 else
-			 /* Crazy HW formatting, bit 5 is on */
-				update_mat[uraw * cols + ucol] = 0 | 0x10;
+			if (uraw == ucol) {
+				update_mat[uraw * cols + ucol] = 1;
+				if (calc->w != 8)
+					/* Crazy HW formatting, bit 5 is on */
+					update_mat[uraw * cols + ucol] |= 0x10;
+			} else {
+				update_mat[uraw * cols + ucol] = 0;
+				if (calc->w != 8)
+					/* Crazy HW formatting, bit 5 is on */
+					update_mat[uraw * cols + ucol] |= 0x10;
+			}
 		}
 	}
 
@@ -198,25 +210,54 @@ mlx5_put_ec_comp(struct mlx5_ec_calc *calc,
 	mlx5_unlock(&pool->lock);
 }
 
+static int is_post_recv(struct mlx5_ec_calc *calc, struct ibv_wc *wc)
+{
+	int num_comps = calc->max_inflight_calcs;
+	int size = sizeof(struct mlx5_ec_comp);
+	uint64_t start = (uintptr_t)calc->comp_pool.comps;
+	uint64_t end = (uintptr_t)calc->comp_pool.comps + num_comps * size;
+
+	if (wc->wr_id >= start && wc->wr_id < end)
+		return 1;
+
+	return 0;
+}
+
 static void handle_ec_comp(struct mlx5_ec_calc *calc, struct ibv_wc *wc)
 {
 	struct mlx5_ec_comp *comp;
 	struct ibv_exp_ec_comp *ec_comp;
-	enum ibv_exp_ec_status status;
+	int post_recv_err;
+	enum ibv_exp_ec_status status = IBV_EXP_EC_CALC_SUCCESS;
 
-	if (unlikely(wc->opcode == IBV_WC_SEND)) {
-		fprintf(stderr, "calc %p got IBV_WC_SEND completion\n", calc);
-		return;
+
+	if (unlikely(wc->status != IBV_WC_SUCCESS)) {
+		status = IBV_EXP_EC_CALC_FAIL;
+		post_recv_err = is_post_recv(calc, wc);
+
+		if (wc->wr_id == EC_BEACON_WRID) {
+			pthread_mutex_lock(&calc->beacon_mutex);
+			pthread_cond_signal(&calc->beacon_cond);
+			pthread_mutex_unlock(&calc->beacon_mutex);
+			return;
+		} else if (!post_recv_err) {
+			if (wc->status == IBV_WC_WR_FLUSH_ERR)
+				fprintf(stderr, "calc on qp 0x%x was flushed.\
+					did you close context with active calcs?\n",
+					wc->qp_num);
+			else
+				fprintf(stderr, "failed calc on qp 0x%x: \
+					got completion with status %s(%d) vendor_err %d\n",
+					wc->qp_num, ibv_wc_status_str(wc->status),
+					wc->status, wc->vendor_err);
+			return;
+		}
+		/* For failed post_recv we return bad status within ec_comp */
 	}
 
 	comp = (struct mlx5_ec_comp *)(uintptr_t)wc->wr_id;
 	if (comp->ec_mat)
 		mlx5_put_ec_mat(calc, comp->ec_mat);
-
-	if (likely(wc->status == IBV_WC_SUCCESS))
-		status = IBV_EXP_EC_CALC_SUCCESS;
-	else
-		status = IBV_EXP_EC_CALC_FAIL;
 
 	ec_comp = comp->comp;
 	mlx5_put_ec_comp(calc, comp);
@@ -448,8 +489,10 @@ static int reg_encode_matrix(struct mlx5_ec_calc *calc, uint8_t *matrix)
 			if (j == 3 && m == 3)
 				continue;
 
-			/* Crazy HW formatting, bit 5 is on */
-			calc->mat[i*cols+j] = matrix[i*m+j] | 0x10;
+			calc->mat[i*cols+j] = matrix[i*m+j];
+			if (calc->w != 8)
+				/* Crazy HW formatting, bit 5 is on */
+				calc->mat[i*cols+j] |= 0x10;
 		}
 
 	calc->mat_mr = ibv_reg_mr(calc->pd, calc->mat,
@@ -636,7 +679,7 @@ free_dump:
 static int
 ec_attr_sanity_checks(struct ibv_exp_ec_calc_init_attr *attr)
 {
-	if (attr->k <= 0 || attr->k > 16) {
+	if (attr->k <= 0 || attr->k > 256) {
 		fprintf(stderr, "Bad K arg (%d)\n", attr->k);
 		return EINVAL;
 	}
@@ -646,8 +689,13 @@ ec_attr_sanity_checks(struct ibv_exp_ec_calc_init_attr *attr)
 		return EINVAL;
 	}
 
-	if (attr->w != 1 && attr->w != 2 && attr->w != 4) {
+	if (attr->w != 1 && attr->w != 2 && attr->w != 4 && attr->w != 8) {
 		fprintf(stderr, "bad W arg (%d)\n", attr->w);
+		return EINVAL;
+	}
+
+	if (attr->k > 16 && attr->w != 8) {
+		fprintf(stderr, "bad K arg (%d) for W=(%d)\n", attr->k, attr->w);
 		return EINVAL;
 	}
 
@@ -692,6 +740,7 @@ mlx5_alloc_ec_calc(struct ibv_pd *pd,
 	calc->max_inflight_calcs = attr->max_inflight_calcs + EC_POLL_BATCH;
 	calc->k = attr->k;
 	calc->m = attr->m;
+	calc->w = attr->w;
 	calc->polling = attr->polling;
 
 	calc->channel = ibv_create_comp_channel(calc->pd->context);
@@ -774,8 +823,33 @@ void
 mlx5_dealloc_ec_calc(struct ibv_exp_ec_calc *ec_calc)
 {
 	struct mlx5_ec_calc *calc = to_mcalc(ec_calc);
+	struct ibv_qp_attr qp_attr;
 	void *status;
+	int err;
 
+	qp_attr.qp_state = IBV_QPS_ERR;
+	err = ibv_modify_qp(calc->qp, &qp_attr, IBV_QP_STATE);
+	if (err) {
+		perror("failed to modify calc qp to ERR");
+		return;
+	}
+
+	if (!calc->polling) {
+		pthread_mutex_init(&calc->beacon_mutex, NULL);
+		pthread_cond_init(&calc->beacon_cond, NULL);
+
+		err = ec_post_recv(calc->qp, NULL, (void *)EC_BEACON_WRID);
+		if (err) {
+			perror("failed to post beacon\n");
+			goto free;
+		}
+
+		pthread_mutex_lock(&calc->beacon_mutex);
+		pthread_cond_wait(&calc->beacon_cond, &calc->beacon_mutex);
+		pthread_mutex_unlock(&calc->beacon_mutex);
+	}
+
+free:
 	free_comps(calc);
 	free_dump(calc);
 	free_matrices(calc);
@@ -933,7 +1007,6 @@ static void
 post_ec_umr(struct mlx5_ec_calc *calc,
 	    struct ibv_sge *klms,
 	    int nklms,
-	    int block_size,
 	    int pattern,
 	    uint32_t umr_key,
 	    void **seg, int *size)
@@ -997,6 +1070,9 @@ post_ec_vec_calc(struct mlx5_ec_calc *calc,
 		vc->calc_op[i] = MLX5_CALC_OP_XOR;
 
 	vc->mat_le_tag_cs = MLX5_CALC_MATRIX | calc->log_chunk_size;
+	if (calc->w == 8)
+		vc->mat_le_tag_cs |= MLX5_CALC_MATRIX_8BIT;
+
 	vc->vec_count = (uint8_t)nvecs;
 	vc->cm_lkey = htonl(matrix_key);
 	vc->cm_addr = htonll((uintptr_t)matrix_addr);
@@ -1022,20 +1098,16 @@ static int ec_post_recv(struct ibv_qp *qp,
 			struct mlx5_ec_comp *comp)
 {
 	struct ibv_recv_wr wr, *bad_wr;
-	int err;
 
 	wr.next = NULL;
-	wr.sg_list = sge;
-	wr.num_sge = 1;
 	wr.wr_id = (uintptr_t)comp;
+	wr.sg_list = sge;
+	if (likely((uintptr_t)sge))
+		wr.num_sge = 1;
+	else
+		wr.num_sge = 0;
 
-	err = mlx5_post_recv(qp, &wr, &bad_wr);
-	if (err) {
-		fprintf(stderr, "failed to post recv calc\n");
-		return err;
-	}
-
-	return 0;
+	return mlx5_post_recv(qp, &wr, &bad_wr);
 }
 
 static unsigned begin_wqe(struct mlx5_qp *qp, void **seg)
@@ -1150,10 +1222,13 @@ static int __mlx5_ec_encode_async(struct mlx5_ec_calc *calc,
 
 	comp = mlx5_get_ec_comp(calc, ec_mat, ec_comp);
 	if (unlikely(!comp)) {
-		fprintf(stderr, "Failed to get comp from pool\n");
-		err = -EINVAL;
+		fprintf(stderr, "Failed to get comp from pool. \
+				Do not activate more then %d inflight calculations \
+				on this calc context.\n", calc->max_inflight_calcs);
+		err = -EOVERFLOW;
 		goto error;
 	}
+
 	err = mlx5_set_encode_code(calc, comp, ec_mem, klms, &out, &out_ptr);
 	if (unlikely(err))
 		goto comp_error;
@@ -1164,14 +1239,15 @@ static int __mlx5_ec_encode_async(struct mlx5_ec_calc *calc,
 
 	/* post recv for calc SEND */
 	err = ec_post_recv((struct ibv_qp *)&qp->verbs_qp, out_ptr, comp);
-	if (unlikely(err))
+	if (unlikely(err)) {
+		fprintf(stderr, "failed to post recv calc\n");
 		goto comp_error;
+	}
 
 	if (m > 1) {
 		/* post pattern KLM - non-signaled */
 		idx = begin_wqe(qp, &seg);
-		post_ec_umr(calc, klms, m, ec_mem->block_size,
-			    1, comp->outumr->lkey, &seg, &size);
+		post_ec_umr(calc, klms, m, 1, comp->outumr->lkey, &seg, &size);
 		finish_wqe(qp, idx, size, NULL);
 		wqe_count++;
 	}
@@ -1179,9 +1255,8 @@ static int __mlx5_ec_encode_async(struct mlx5_ec_calc *calc,
 	if (!contig) {
 		/* post UMR of input - non-signaled */
 		idx = begin_wqe(qp, &seg);
-		post_ec_umr(calc, ec_mem->data_blocks, k,
-			    ec_mem->block_size, 0, comp->inumr->lkey,
-			    &seg, &size);
+		post_ec_umr(calc, ec_mem->data_blocks, k, 0,
+			    comp->inumr->lkey, &seg, &size);
 		finish_wqe(qp, idx, size, NULL);
 		wqe_count++;
 	}
@@ -1423,7 +1498,7 @@ static int __mlx5_ec_decode_async(struct mlx5_ec_calc *calc,
 	struct mlx5_qp *qp = to_mqp(calc->qp);
 	struct mlx5_ec_mat *decode;
 	struct mlx5_ec_comp *comp;
-	struct ibv_sge in_klms[16]; /* XXX: relief the stack? */
+	struct ibv_sge in_klms[256]; /* XXX: relief the stack? */
 	struct ibv_sge out_klms[4];
 	struct ibv_sge out, in;
 	void *uninitialized_var(seg);
@@ -1439,8 +1514,11 @@ static int __mlx5_ec_decode_async(struct mlx5_ec_calc *calc,
 
 	comp = mlx5_get_ec_comp(calc, decode, ec_comp);
 	if (unlikely(!comp)) {
+		fprintf(stderr, "Failed to get comp from pool. \
+				Do not activate more then %d inflight calculations \
+				on this calc context.\n", calc->max_inflight_calcs);
 		fprintf(stderr, "Failed to get comp from pool\n");
-		err = -EINVAL;
+		err = -EOVERFLOW;
 		goto mat_error;
 	}
 
@@ -1452,22 +1530,22 @@ static int __mlx5_ec_decode_async(struct mlx5_ec_calc *calc,
 
 	/* post recv for calc SEND */
 	err = ec_post_recv(calc->qp, &out, comp);
-	if (unlikely(err))
+	if (unlikely(err)) {
+		fprintf(stderr, "failed to post recv calc\n");
 		goto comp_error;
+	}
 
 	if (m > 1) {
 		/* post pattern KLM of output - non-signaled */
 		idx = begin_wqe(qp, &seg);
-		post_ec_umr(calc, out_klms, m, ec_mem->block_size,
-			    1, comp->outumr->lkey, &seg, &size);
+		post_ec_umr(calc, out_klms, m, 1, comp->outumr->lkey, &seg, &size);
 		finish_wqe(qp, idx, size, NULL);
 		wqe_count++;
 	}
 
 	/* post UMR of input - non-signaled */
 	idx = begin_wqe(qp, &seg);
-	post_ec_umr(calc, in_klms, k, ec_mem->block_size,
-		    0, comp->inumr->lkey, &seg, &size);
+	post_ec_umr(calc, in_klms, k, 0, comp->inumr->lkey, &seg, &size);
 	finish_wqe(qp, idx, size, NULL);
 	wqe_count++;
 
