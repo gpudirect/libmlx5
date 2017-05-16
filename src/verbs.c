@@ -814,6 +814,14 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 		goto err_spl;
 	}
 
+	if (cq->peer_enabled && cq->buf_a.peer.pb) {
+		if (cq->buf_a.peer.pb->comp_mask != IBV_EXP_PEER_BUF_VERSION) {
+			mlx5_dbg(fp, MLX5_DBG_CQ, "invalid cq peer buf comp_mask=0x%x\n",
+				 cq->buf_a.peer.pb->comp_mask);
+			goto err_buf;
+		}
+	}
+
 	if (cq->peer_enabled &&
 	    mlx5_alloc_cq_peer_buf(mctx, cq, ncqe)) {
 		mlx5_dbg(fp, MLX5_DBG_CQ, "\n");
@@ -829,8 +837,14 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 			IBV_EXP_PEER_DIRECTION_TO_HCA;
 		attr.alignment = mctx->cache_line_size;
 		cq->peer_dbrec_buf = cq->peer_ctx->buf_alloc(&attr);
-		if (cq->peer_dbrec_buf)
+		if (cq->peer_dbrec_buf) {
 			cq->dbrec = cq->peer_dbrec_buf->addr;
+			if (cq->peer_dbrec_buf->comp_mask != IBV_EXP_PEER_BUF_VERSION) {
+				mlx5_dbg(fp, MLX5_DBG_CQ, "invalid dbrec peer buf comp_mask=0x%x\n",
+					 cq->peer_dbrec_buf->comp_mask);
+				goto err_peer_buf;
+			}
+                }
 	}
 	if (!cq->dbrec)
 		cq->dbrec = mlx5_alloc_dbrec(mctx);
@@ -872,8 +886,14 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 				MLX5_CQ_CREATION_FLAG_COMPRESSED_CQE;
 		}
 
-		cmd_e.buf_addr = (uintptr_t) cq->buf_a.buf;
-		cmd_e.db_addr  = (uintptr_t) cq->dbrec;
+		if (cq->buf_a.peer.pb)
+			cmd_e.buf_addr = (uintptr_t) cq->buf_a.peer.pb->peer_addr;
+		else
+			cmd_e.buf_addr = (uintptr_t) cq->buf_a.buf;
+		if (cq->peer_dbrec_buf)
+                    cmd_e.db_addr  = cq->peer_dbrec_buf->peer_addr;
+                else
+                    cmd_e.db_addr  = (uintptr_t) cq->dbrec;
 		cmd_e.cqe_size = cqe_sz;
 		cmd_e.size_of_prefix = offsetof(struct mlx5_exp_create_cq,
 						prefix_reserved);
@@ -886,8 +906,14 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 			cmd_e.exp_data.cqe_comp_recv_type = MLX5_CQE_FORMAT_HASH;
 		}
 	} else {
-		cmd.buf_addr = (uintptr_t) cq->buf_a.buf;
-		cmd.db_addr  = (uintptr_t) cq->dbrec;
+		if (cq->buf_a.peer.pb)
+			cmd_e.buf_addr = (uintptr_t) cq->buf_a.peer.pb->peer_addr;
+		else
+			cmd_e.buf_addr = (uintptr_t) cq->buf_a.buf;
+		if (cq->peer_dbrec_buf)
+                    cmd_e.db_addr  = cq->peer_dbrec_buf->peer_addr;
+                else
+                    cmd_e.db_addr  = (uintptr_t) cq->dbrec;
 		cmd.cqe_size = cqe_sz;
 	}
 
