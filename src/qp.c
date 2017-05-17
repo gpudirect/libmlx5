@@ -3213,3 +3213,28 @@ struct ibv_exp_wq_family *mlx5_get_wq_family(struct mlx5_rwq *rwq,
 	return family;
 }
 
+int mlx5_exp_peer_query_qp(struct ibv_qp *ibqp, struct ibv_exp_peer_query_qp *query_qp)
+{
+	struct mlx5_qp *qp = to_mqp(ibqp);
+
+	query_qp->qp_num       = ibqp->qp_num;
+
+	query_qp->tx_wq        = (uint64_t)qp->sq.buff;
+	query_qp->tx_wqe_cnt   =           qp->sq.wqe_cnt;
+	query_qp->tx_dbrec     = (uint64_t)qp->sq.db;
+	query_qp->tx_max_post  =           qp->sq.max_post;
+
+	query_qp->rx_wq        = (uint64_t)qp->rq.buff;
+	query_qp->rx_wqe_cnt   =           qp->rq.wqe_cnt;
+	query_qp->rx_dbrec     = (uint64_t)qp->rq.db;
+	query_qp->rx_max_post  =           qp->rq.max_post;
+
+	query_qp->bf_reg       = (uint64_t)qp->gen_data.bf->reg;
+	query_qp->bf_need_lock = qp->gen_data.bf->need_lock;
+	query_qp->bf_offset    = qp->gen_data.bf->offset;
+	query_qp->bf_buf_size  = qp->gen_data.bf->buf_size;
+	query_qp->bf_uuarn     = qp->gen_data.bf->uuarn;
+	query_qp->bf_db_method = qp->gen_data.bf->db_method;
+
+	return 0;
+}

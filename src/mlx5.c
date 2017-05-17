@@ -645,6 +645,9 @@ static void set_experimental(struct ibv_context *ctx)
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_rollback_send, mlx5_exp_rollback_send);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_peek_cq, mlx5_exp_peer_peek_cq);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_abort_peek_cq, mlx5_exp_peer_abort_peek_cq);
+
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_query_qp, mlx5_exp_peer_query_qp);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_query_cq, mlx5_exp_peer_query_cq);
 }
 
 void *mlx5_uar_mmap(int idx, int cmd, int page_size, int cmd_fd)

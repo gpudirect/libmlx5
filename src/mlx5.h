@@ -1259,6 +1259,8 @@ int mlx5_exp_peer_peek_cq(struct ibv_cq *cq,
 			  struct ibv_exp_peer_peek *peek_ctx);
 int mlx5_exp_peer_abort_peek_cq(struct ibv_cq *ibcq,
 				struct ibv_exp_peer_abort_peek *ack_ctx);
+int mlx5_exp_peer_query_qp(struct ibv_qp *qp, struct ibv_exp_peer_query_qp *query_qp);
+int mlx5_exp_peer_query_cq(struct ibv_cq *ibcq, struct ibv_exp_peer_query_cq *query_cq);
 
 static inline void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx)
 {
