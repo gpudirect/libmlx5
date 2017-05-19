@@ -2224,6 +2224,10 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	qp->sq.db = &qp->gen_data.db[MLX5_SND_DBR];
 
 	drv->buf_addr = (uintptr_t) qp->buf.buf;
+	if (qp->buf.peer.pb && (drv->buf_addr != (uintptr_t) qp->buf.peer.pb->addr)) {
+		mlx5_dbg(fp, MLX5_DBG_QP, "Invalid peer buf_addr\n");
+		goto err_rq_db;
+	}
 	if (attrx->qp_type == IBV_QPT_RAW_ETH || qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) {
 		drvx->exp.sq_buf_addr = (uintptr_t)qp->sq_buf.buf;
 		drvx->exp.flags |= MLX5_EXP_CREATE_QP_MULTI_PACKET_WQE_REQ_FLAG;
@@ -2235,6 +2239,10 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		}
 	}
 	drv->db_addr  = (uintptr_t) qp->gen_data.db;
+	if (qp->peer_db_buf && (drv->db_addr != (uintptr_t) qp->peer_db_buf->addr)) {
+		mlx5_dbg(fp, MLX5_DBG_QP, "Invalid peer db_addr\n");
+		goto err_rq_db;
+	}
 	drv->sq_wqe_count = qp->sq.wqe_cnt;
 	drv->rq_wqe_count = qp->rq.wqe_cnt;
 	drv->rq_wqe_shift = qp->rq.wqe_shift;
