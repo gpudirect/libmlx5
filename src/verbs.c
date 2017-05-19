@@ -2166,14 +2166,20 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	qp->rq.db = &qp->gen_data.db[MLX5_RCV_DBR];
 	qp->sq.db = &qp->gen_data.db[MLX5_SND_DBR];
 
-	drv->buf_addr = (uintptr_t) qp->buf.buf;
+	if (qp->buf.peer.pb)
+		drv->buf_addr = (uintptr_t) qp->buf.peer.pb->peer_addr;
+	else
+		drv->buf_addr = (uintptr_t) qp->buf.buf;
 	if (attrx->qp_type == IBV_QPT_RAW_ETH) {
 		drvx->exp.sq_buf_addr = (uintptr_t)qp->sq_buf.buf;
 		drvx->exp.flags |= MLX5_EXP_CREATE_QP_MULTI_PACKET_WQE_REQ_FLAG;
 		drvx->exp.comp_mask |= MLX5_EXP_CREATE_QP_MASK_SQ_BUFF_ADD |
 				       MLX5_EXP_CREATE_QP_MASK_FLAGS_IDX;
 	}
-	drv->db_addr  = (uintptr_t) qp->gen_data.db;
+	if (qp->peer_db_buf)
+		drv->db_addr  = (uintptr_t) qp->peer_db_buf->peer_addr;
+	else
+		drv->db_addr  = (uintptr_t) qp->gen_data.db;
 	drv->sq_wqe_count = qp->sq.wqe_cnt;
 	drv->rq_wqe_count = qp->rq.wqe_cnt;
 	drv->rq_wqe_shift = qp->rq.wqe_shift;
