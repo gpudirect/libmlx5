@@ -2076,7 +2076,10 @@ int mlx5_exp_peer_query_cq(struct ibv_cq *ibcq, struct ibv_exp_peer_query_cq *qu
 {
 	struct mlx5_cq *cq = to_mcq(ibcq);
 
-	query_cq->buf = (uint64_t)cq->active_buf;
+        if (!cq->peer_enabled)
+               return EINVAL;
+
+	query_cq->buf = (uint64_t)cq->active_buf->buf;
 	query_cq->cqe_size = cq->cqe_sz;
 	query_cq->n_cqes = cq->ibv_cq.cqe + 1;
 	query_cq->dbrec = (uint64_t)&cq->dbrec[MLX5_CQ_SET_CI];
