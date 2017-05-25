@@ -3217,6 +3217,9 @@ int mlx5_exp_peer_query_qp(struct ibv_qp *ibqp, struct ibv_exp_peer_query_qp *qu
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 
+        if (!qp->peer_enabled)
+               return EINVAL;
+
 	query_qp->qp_num       = ibqp->qp_num;
 
 	query_qp->tx_wq        = (uint64_t)qp->sq.buff;
