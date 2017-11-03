@@ -907,13 +907,13 @@ static struct ibv_cq *create_cq(struct ibv_context *context,
 		}
 	} else {
 		if (cq->buf_a.peer.pb)
-			cmd_e.buf_addr = (uintptr_t) cq->buf_a.peer.pb->peer_addr;
+			cmd.buf_addr = (uintptr_t) cq->buf_a.peer.pb->peer_addr;
 		else
-			cmd_e.buf_addr = (uintptr_t) cq->buf_a.buf;
+			cmd.buf_addr = (uintptr_t) cq->buf_a.buf;
 		if (cq->peer_dbrec_buf)
-                    cmd_e.db_addr  = cq->peer_dbrec_buf->peer_addr;
+                    cmd.db_addr  = cq->peer_dbrec_buf->peer_addr;
                 else
-                    cmd_e.db_addr  = (uintptr_t) cq->dbrec;
+                    cmd.db_addr  = (uintptr_t) cq->dbrec;
 		cmd.cqe_size = cqe_sz;
 	}
 
