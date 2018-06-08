@@ -1590,6 +1590,10 @@ int mlx5_alloc_cq_buf(struct mlx5_context *mctx, struct mlx5_cq *cq,
 		cqe = buf->buf + i * cqe_sz;
 		cqe += cqe_sz == 128 ? 1 : 0;
 		cqe->op_own = MLX5_CQE_INVALID << 4;
+		if (cq->peer_enabled && 
+		    (cq->peer_ctx->caps & IBV_EXP_PEER_OP_POLL_NOR_DWORD_CAP)) {
+			cqe->op_own |= MLX5_CQE_OWNER_MASK;
+		}
 	}
 
 	return 0;
