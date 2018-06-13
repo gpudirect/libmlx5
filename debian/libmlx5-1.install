@@ -1,2 +1,2 @@
-usr/lib/libmlx5-rdmav2.so		/usr/lib/libibverbs/
+usr/lib/libmlx5*.so.*
 etc/libibverbs.d/mlx5.driver

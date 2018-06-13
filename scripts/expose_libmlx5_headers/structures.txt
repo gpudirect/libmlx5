@@ -22,6 +22,7 @@ mlx5_wqe_signature_seg
 mlx5_wqe_inline_seg
 mlx5_wqe_wait_en_seg
 mlx5_err_cqe
+mlx5_tm_cqe
 mlx5_cqe64
 mlx5_spinlock
 mlx5_lock

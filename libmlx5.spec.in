@@ -8,7 +8,7 @@
 %endif
 
 Name: libmlx5
-Version: 1.2.1mlnx1
+Version: 41mlnx1
 Release: 1%{?dist}
 Summary: Mellanox ConnectX-IB InfiniBand HCA Userspace Driver
 
@@ -19,6 +19,8 @@ Source: http://openfabrics.org/downloads/mlx5/%{name}-%{version}.tar.gz
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
 BuildRequires: libibverbs-devel >= 1.1-0.1.rc2
+Requires(post): /sbin/ldconfig
+Requires(postun): /sbin/ldconfig
 %if %{_with_valgrind}
 BuildRequires: valgrind-devel
 %endif
@@ -60,16 +62,22 @@ mkdir -p %{buildroot}/%{_libdir}/mlnx_ofed
 cp -a $RPM_BUILD_DIR/%{name}-%{version}/valgrind/%{_libdir}/mlnx_ofed/valgrind %{buildroot}/%{_libdir}/mlnx_ofed
 %endif
 # remove unpackaged files from the buildroot
-rm -f $RPM_BUILD_ROOT%{_libdir}/*.la $RPM_BUILD_ROOT%{_libdir}/libmlx5.so
+rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 
 %clean
 rm -rf $RPM_BUILD_ROOT
 
+%post -p /sbin/ldconfig
+
+%postun -p /sbin/ldconfig
+
 %files
 %defattr(-,root,root,-)
+%{_libdir}/libmlx5*.so.*
 %{_libdir}/libmlx5-rdmav2.so
 %if %{_with_valgrind}
-%{_libdir}/mlnx_ofed/valgrind/libmlx5*.so
+%{_libdir}/mlnx_ofed/valgrind/libmlx5*.so.*
+%{_libdir}/mlnx_ofed/valgrind/libmlx5-rdmav2.so
 %endif
 %{_sysconfdir}/libibverbs.d/mlx5.driver
 %doc AUTHORS COPYING README
@@ -77,6 +85,10 @@ rm -rf $RPM_BUILD_ROOT
 %files devel
 %defattr(-,root,root,-)
 %{_libdir}/libmlx5.a
+%{_libdir}/libmlx5.so
+%if %{_with_valgrind}
+%{_libdir}/mlnx_ofed/valgrind/libmlx5.so
+%endif
 %{_prefix}/include/infiniband/
 
 %changelog

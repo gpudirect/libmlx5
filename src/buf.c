@@ -77,7 +77,7 @@ static int mlx5_bitmap_init(struct mlx5_bitmap *bitmap, uint32_t num,
 	bitmap->avail = num;
 	bitmap->mask = mask;
 	bitmap->avail = bitmap->max;
-	bitmap->table = calloc(BITS_TO_LONGS(bitmap->max), sizeof(uint32_t));
+	bitmap->table = calloc(BITS_TO_LONGS(bitmap->max), sizeof(long));
 	if (!bitmap->table)
 		return -ENOMEM;
 
@@ -662,7 +662,7 @@ static void *mlx5_alloc_numa(size_t size, int numa)
 {
 	void *ptr;
 
-	if (numa < 0 || numa_available() == -1)
+	if (numa < 0 || numa_available() == -1 || numa_node_size(numa, NULL) <= 0)
 		return NULL;
 
 	numa_set_strict(1);
@@ -707,9 +707,10 @@ int mlx5_alloc_buf(struct mlx5_buf *buf, size_t size, int page_size)
 		buf->numa_alloc = 1;
 	} else {
 		buf->numa_alloc = 0;
-		ret = posix_memalign(&buf->buf, page_size, al_size);
-		if (ret)
-			return ret;
+		buf->buf = mmap(NULL, al_size, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (buf->buf == MAP_FAILED)
+			return errno;
 	}
 
 	ret = ibv_dontfork_range(buf->buf, al_size);
@@ -717,7 +718,7 @@ int mlx5_alloc_buf(struct mlx5_buf *buf, size_t size, int page_size)
 		if (buf->numa_alloc)
 			mlx5_free_numa(buf->buf, al_size);
 		else
-			free(buf->buf);
+			munmap(buf->buf, al_size);
 	}
 
 	if (!ret) {
@@ -734,5 +735,5 @@ void mlx5_free_buf(struct mlx5_buf *buf)
 	if (buf->numa_alloc)
 		mlx5_free_numa(buf->buf, buf->length);
 	else
-		free(buf->buf);
+		munmap(buf->buf, buf->length);
 }

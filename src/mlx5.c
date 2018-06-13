@@ -87,6 +87,10 @@ struct {
 	HCA(MELLANOX, 4120),	/* ConnectX-5 VF */
 	HCA(MELLANOX, 4121),	/* ConnectX-5, PCIe 4.0 */
 	HCA(MELLANOX, 4122),	/* ConnectX-5, PCIe 4.0 VF */
+	HCA(MELLANOX, 4123),    /* ConnectX-6 */
+	HCA(MELLANOX, 4124),	/* ConnectX-6 VF */
+	HCA(MELLANOX, 41682),	/* BlueField integrated ConnectX-5 network controller */
+	HCA(MELLANOX, 41683),	/* BlueField integrated ConnectX-5 network controller VF */
 };
 
 uint32_t mlx5_debug_mask = 0;
@@ -441,9 +445,18 @@ static void mlx5_read_env(struct mlx5_context *ctx)
 	}
 }
 
-static int get_total_uuars(void)
+static int get_total_uuars(int page_size)
 {
-	return MLX5_DEF_TOT_UUARS;
+	int size = MLX5_DEF_TOT_UUARS;
+	int uuars_in_page;
+
+	uuars_in_page = page_size / MLX5_ADAPTER_PAGE_SIZE * MLX5_NUM_NON_FP_BFREGS_PER_UAR;
+	size = max(uuars_in_page, size);
+	size = align(size, MLX5_NUM_NON_FP_BFREGS_PER_UAR);
+	if (size > MLX5_MAX_BFREGS)
+		return -ENOMEM;
+
+	return size;
 }
 
 static void open_debug_file(struct mlx5_context *ctx)
@@ -505,6 +518,16 @@ static int get_shut_up_bf(struct ibv_context *context)
 	return strcmp(env, "0") ? 1 : 0;
 }
 
+static int get_shut_up_mw(struct ibv_context *context)
+{
+	char env[VERBS_MAX_ENV_VAL];
+
+	if (ibv_exp_cmd_getenv(context, "MLX5_SHUT_UP_MW", env, sizeof(env)))
+		return 0;
+
+	return strcmp(env, "0") ? 1 : 0;
+}
+
 static int get_cqe_comp(struct ibv_context *context)
 {
 	char env[VERBS_MAX_ENV_VAL];
@@ -525,9 +548,9 @@ static int get_use_mutex(struct ibv_context *context)
 	return strcmp(env, "0") ? 1 : 0;
 }
 
-static int get_num_low_lat_uuars(void)
+static int get_num_low_lat_uuars(int tot_uuars)
 {
-	return 4;
+	return max(4, tot_uuars - MLX5_MED_BFREGS_TSHOLD);
 }
 
 static int need_uuar_lock(struct mlx5_context *ctx, int uuarn)
@@ -653,6 +676,14 @@ static void set_experimental(struct ibv_context *ctx)
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_rollback_send, mlx5_exp_rollback_send);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_peek_cq, mlx5_exp_peer_peek_cq);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_peer_abort_peek_cq, mlx5_exp_peer_abort_peek_cq);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_set_context_attr, mlx5_exp_set_context_attr);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_create_srq,
+			     mlx5_exp_create_srq);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_post_srq_ops,
+			     mlx5_exp_post_srq_ops);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_alloc_dm, mlx5_exp_alloc_dm);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_free_dm, mlx5_exp_free_dm);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, exp_memcpy_dm, mlx5_exp_memcpy_dm);
 }
 
 void *mlx5_uar_mmap(int idx, int cmd, int page_size, int cmd_fd)
@@ -677,14 +708,15 @@ void read_init_vars(struct mlx5_context *ctx)
 		set_freeze_on_error(&ctx->ibv_ctx);
 		ctx->prefer_bf = get_always_bf(&ctx->ibv_ctx);
 		ctx->shut_up_bf = get_shut_up_bf(&ctx->ibv_ctx);
+		ctx->shut_up_mw = get_shut_up_mw(&ctx->ibv_ctx);
 		mlx5_read_env(ctx);
 		ctx->env_initialized = 1;
 	}
 	pthread_mutex_unlock(&ctx->env_mtx);
 }
 
-static int mlx5_map_internal_clock(struct mlx5_device *mdev,
-				   struct ibv_context *ibv_ctx)
+static void mlx5_map_internal_clock(struct mlx5_device *mdev,
+				    struct ibv_context *ibv_ctx)
 {
 	struct mlx5_context *context = to_mctx(ibv_ctx);
 	void *hca_clock_page;
@@ -695,21 +727,171 @@ static int mlx5_map_internal_clock(struct mlx5_device *mdev,
 			      PROT_READ, MAP_SHARED, ibv_ctx->cmd_fd,
 			      offset * mdev->page_size);
 
-	if (hca_clock_page == MAP_FAILED) {
-		fprintf(stderr, PFX
-			"Warning: Timestamp available,\n"
-			"but failed to mmap() hca core clock page.\n");
-		return -1;
-	}
+	if (hca_clock_page == MAP_FAILED)
+		fprintf(stderr, PFX "Timestamp available but failed to mmap() hca core clock page.\n");
+	else
+		context->hca_core_clock = hca_clock_page +
+					  context->core_clock.offset;
 
-	context->hca_core_clock = hca_clock_page + context->core_clock.offset;
+	return;
+}
+
+static void mlx5_map_clock_info(struct mlx5_device *mdev,
+				struct ibv_context *ibv_ctx)
+{
+	struct mlx5_context *context = to_mctx(ibv_ctx);
+	void *clock_info_page;
+	off_t offset = 0;
+
+	set_command(MLX5_EXP_IB_MMAP_CLOCK_INFO_CMD, &offset);
+	set_index(MLX5_EXP_CLOCK_INFO_V1, &offset);
+	clock_info_page = mmap(NULL, mdev->page_size,
+			       PROT_READ, MAP_SHARED, ibv_ctx->cmd_fd,
+			       offset * mdev->page_size);
+	if (clock_info_page != MAP_FAILED)
+		context->clock_info_page = clock_info_page;
+
+	return;
+}
+
+int mlx5dv_query_device(struct ibv_context *ctx_in,
+			 struct mlx5dv_context *attrs_out)
+{
+	attrs_out->comp_mask = 0;
+	attrs_out->version   = 0;
+	attrs_out->flags     = 0;
+
+	if (to_mctx(ctx_in)->cqe_version == MLX5_CQE_VERSION_V1)
+		attrs_out->flags |= MLX5DV_CONTEXT_FLAGS_CQE_V1;
 
 	return 0;
 }
 
+static int mlx5dv_get_qp(struct ibv_qp *qp_in,
+			 struct mlx5dv_qp *qp_out)
+{
+	struct mlx5_qp *mqp = to_mqp(qp_in);
+
+	qp_out->comp_mask = 0;
+	qp_out->dbrec     = mqp->gen_data.db;
+
+	if (mqp->sq_buf_size)
+		/* IBV_QPT_RAW_PACKET */
+		qp_out->sq.buf = (void *)((uintptr_t)mqp->sq_buf.buf);
+	else
+		qp_out->sq.buf = (void *)((uintptr_t)mqp->buf.buf + mqp->sq.offset);
+	qp_out->sq.wqe_cnt = mqp->sq.wqe_cnt;
+	qp_out->sq.stride  = 1 << mqp->sq.wqe_shift;
+
+	qp_out->rq.buf     = (void *)((uintptr_t)mqp->buf.buf + mqp->rq.offset);
+	qp_out->rq.wqe_cnt = mqp->rq.wqe_cnt;
+	qp_out->rq.stride  = 1 << mqp->rq.wqe_shift;
+
+	qp_out->bf.reg    = mqp->gen_data.bf->reg;
+
+	if (mqp->gen_data.bf->uuarn > 0)
+		qp_out->bf.size = mqp->gen_data.bf->buf_size;
+	else
+		qp_out->bf.size = 0;
+
+	return 0;
+}
+
+static int mlx5dv_get_cq(struct ibv_cq *cq_in,
+			 struct mlx5dv_cq *cq_out)
+{
+	struct mlx5_cq *mcq = to_mcq(cq_in);
+	struct mlx5_context *mctx = to_mctx(cq_in->context);
+
+	cq_out->comp_mask = 0;
+	cq_out->cqn       = mcq->cqn;
+	cq_out->cqe_cnt   = mcq->ibv_cq.cqe + 1;
+	cq_out->cqe_size  = mcq->cqe_sz;
+	cq_out->buf       = mcq->active_buf->buf;
+	cq_out->dbrec     = mcq->dbrec;
+	cq_out->uar	  = mctx->uar;
+
+	mcq->model_flags  |= MLX5_CQ_MODEL_FLAG_DV_OWNED;
+
+	return 0;
+}
+
+static int mlx5dv_get_rwq(struct ibv_exp_wq *wq_in,
+			  struct mlx5dv_rwq *rwq_out)
+{
+	struct mlx5_rwq *mrwq = to_mrwq(wq_in);
+
+	rwq_out->comp_mask = 0;
+	rwq_out->buf       = mrwq->buf.buf + mrwq->rq.offset;
+	rwq_out->dbrec     = mrwq->db;
+	rwq_out->wqe_cnt   = mrwq->rq.wqe_cnt;
+	rwq_out->stride    = 1 << mrwq->rq.wqe_shift;
+
+	return 0;
+}
+
+static int mlx5dv_get_srq(struct ibv_srq *srq_in,
+			  struct mlx5dv_srq *srq_out)
+{
+	struct mlx5_srq *msrq;
+
+	msrq = container_of(srq_in, struct mlx5_srq, vsrq.srq);
+
+	srq_out->comp_mask = 0;
+	srq_out->buf       = msrq->buf.buf;
+	srq_out->dbrec     = msrq->db;
+	srq_out->stride    = 1 << msrq->wqe_shift;
+	srq_out->head      = msrq->head;
+	srq_out->tail      = msrq->tail;
+
+	return 0;
+}
+
+int mlx5dv_init_obj(struct mlx5dv_obj *obj, uint64_t obj_type)
+{
+	int ret = 0;
+
+	if (obj_type & MLX5DV_OBJ_QP)
+		ret = mlx5dv_get_qp(obj->qp.in, obj->qp.out);
+	if (!ret && (obj_type & MLX5DV_OBJ_CQ))
+		ret = mlx5dv_get_cq(obj->cq.in, obj->cq.out);
+	if (!ret && (obj_type & MLX5DV_OBJ_SRQ))
+		ret = mlx5dv_get_srq(obj->srq.in, obj->srq.out);
+	if (!ret && (obj_type & MLX5DV_OBJ_RWQ))
+		ret = mlx5dv_get_rwq(obj->rwq.in, obj->rwq.out);
+
+	return ret;
+}
+
 enum mlx5_cap_flags {
 	MLX5_CAP_COMPACT_AV	= 1 << 0,
+	MLX5_CAP_ODP_IMPLICIT	= 1 << 1,
 };
+
+int mlx5_exp_set_context_attr(struct ibv_context *context,
+			      struct ibv_exp_open_device_attr *attr)
+{
+	struct ibv_exp_cmd_set_context_attr cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	return ibv_exp_cmd_set_context_attr(context, attr, &cmd,
+					    sizeof(cmd));
+}
+
+static void adjust_uar_info(struct mlx5_device *mdev,
+			    struct mlx5_context *context,
+			    struct mlx5_exp_alloc_ucontext_resp resp)
+{
+	if (!resp.log_uar_size && !resp.num_uars_per_page) {
+		/* old kernel */
+		context->uar_size = mdev->page_size;
+		context->num_uars_per_page = 1;
+		return;
+	}
+
+	context->uar_size = 1 << resp.log_uar_size;
+	context->num_uars_per_page = resp.num_uars_per_page;
+}
 
 static int mlx5_alloc_context(struct verbs_device *vdev,
 			      struct ibv_context *ctx, int cmd_fd)
@@ -720,6 +902,7 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	struct ibv_device		*ibdev = &vdev->device;
 	struct verbs_context *verbs_ctx = verbs_get_ctx(ctx);
 	struct ibv_exp_device_attr attr;
+	int	num_sys_page_map;
 	int	i;
 	int	page_size = to_mdev(ibdev)->page_size;
 	int	tot_uuars;
@@ -730,6 +913,8 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	off_t	offset;
 	int	err;
 	int	legacy_uar_map = 0;
+	int	bfi;
+	int	k;
 
 	context = to_mctx(ctx);
 	if (pthread_mutex_init(&context->env_mtx, NULL))
@@ -741,18 +926,16 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	if (gethostname(context->hostname, sizeof(context->hostname)))
 		strcpy(context->hostname, "host_unknown");
 
-	tot_uuars = get_total_uuars();
-	gross_uuars = tot_uuars / MLX5_NUM_UUARS_PER_PAGE * 4;
-	context->bfs = calloc(gross_uuars, sizeof *context->bfs);
-	if (!context->bfs) {
-		errno = ENOMEM;
+	tot_uuars = get_total_uuars(page_size);
+	if (tot_uuars < 0) {
+		errno = -tot_uuars;
 		goto err_free;
 	}
 
-	low_lat_uuars = get_num_low_lat_uuars();
+	low_lat_uuars = get_num_low_lat_uuars(tot_uuars);
 	if (low_lat_uuars > tot_uuars - 1) {
 		errno = ENOMEM;
-		goto err_free_bf;
+		goto err_free;
 	}
 
 	memset(&req, 0, sizeof(req));
@@ -760,9 +943,11 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	req.total_num_uuars = tot_uuars;
 	req.num_low_latency_uuars = low_lat_uuars;
 	req.cqe_version = MLX5_CQE_VERSION_V1;
+	req.lib_caps |= MLX5_LIB_CAP_4K_UAR;
+
 	if (ibv_cmd_get_context(&context->ibv_ctx, &req.ibv_req, sizeof req,
 				&resp.ibv_resp, sizeof resp))
-		goto err_free_bf;
+		goto err_free;
 
 	context->max_num_qps		= resp.qp_tab_size;
 	context->bf_reg_size		= resp.bf_reg_size;
@@ -775,11 +960,26 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 	context->num_ports	= resp.num_ports;
 	context->max_recv_wr	= resp.max_recv_wr;
 	context->max_srq_recv_wr = resp.max_srq_recv_wr;
+	adjust_uar_info(to_mdev(&vdev->device), context, resp);
 
+	gross_uuars = context->tot_uuars / MLX5_NUM_NON_FP_BFREGS_PER_UAR * NUM_BFREGS_PER_UAR;
+	context->bfs = calloc(gross_uuars, sizeof(*context->bfs));
+	if (!context->bfs) {
+		errno = ENOMEM;
+		goto err_free;
+	}
 	context->cmds_supp_uhw = resp.cmds_supp_uhw;
 
-	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_FLAGS)
-		context->compact_av = resp.exp_data.flags & MLX5_CAP_COMPACT_AV;
+	if (resp.eth_min_inline)
+		context->eth_min_inline_size = ((resp.eth_min_inline - 1) == MLX5_INLINE_MODE_NONE) ?
+					       0 : MLX5_ETH_INLINE_HEADER_SIZE;
+	else
+		context->eth_min_inline_size = MLX5_ETH_INLINE_HEADER_SIZE;
+
+	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_FLAGS) {
+		context->compact_av   = resp.exp_data.flags & MLX5_CAP_COMPACT_AV;
+		context->implicit_odp = resp.exp_data.flags & MLX5_CAP_ODP_IMPLICIT;
+	}
 
 	if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_CQE_COMP_MAX_NUM)
 		context->cqe_comp_max_num = resp.exp_data.cqe_comp_max_num;
@@ -841,6 +1041,13 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 			context->core_clock.shift = 21;
 			context->core_clock.mask = (1ULL << 49) - 1;
 		}
+
+		if (resp.exp_data.comp_mask & MLX5_EXP_ALLOC_CTX_RESP_MASK_CLOCK_INFO &&
+		    resp.exp_data.clock_info_version_mask & 1)
+			mlx5_map_clock_info(to_mdev(ibdev), ctx);
+
+		if (attr.comp_mask & IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE)
+			context->max_dm_size = attr.max_dm_size;
 	}
 
 	pthread_mutex_init(&context->rsc_table_mutex, NULL);
@@ -857,6 +1064,7 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 
 	context->prefer_bf = get_always_bf(&context->ibv_ctx);
 	context->shut_up_bf = get_shut_up_bf(&context->ibv_ctx);
+	context->shut_up_mw = get_shut_up_mw(&context->ibv_ctx);
 	context->enable_cqe_comp = get_cqe_comp(&context->ibv_ctx);
 	mlx5_use_mutex = get_use_mutex(&context->ibv_ctx);
 
@@ -868,7 +1076,9 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 		context->cc.buf = NULL;
 
 	mlx5_single_threaded = single_threaded_app(&context->ibv_ctx);
-	for (i = 0; i < resp.tot_uuars / MLX5_NUM_UUARS_PER_PAGE; ++i) {
+
+	num_sys_page_map = context->tot_uuars / (context->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR);
+	for (i = 0; i < num_sys_page_map; ++i) {
 		uar_mapped = 0;
 
 		/* Don't map UAR to WC if BF is not used */
@@ -904,33 +1114,40 @@ static int mlx5_alloc_context(struct verbs_device *vdev,
 		}
 	}
 
-	for (j = 0; j < gross_uuars; ++j) {
-		context->bfs[j].reg = context->uar[j / 4].regs +
-			MLX5_BF_OFFSET + (j % 4) * context->bf_reg_size;
-		context->bfs[j].need_lock = need_uuar_lock(context, j) &&
-					    context->uar[j / 4].map_type == MLX5_UAR_MAP_WC;
-		mlx5_lock_init(&context->bfs[j].lock,
-			       !mlx5_single_threaded,
-			       mlx5_get_locktype());
-		context->bfs[j].offset = 0;
-		if (context->uar[j / 4].map_type == MLX5_UAR_MAP_WC) {
-			/* In case of legacy mapping we don't know if UAR
-			 * mapped as NC or WC. To be on the safe side we assume
-			 * mapping as WC but BF buf_size = 0 this will force DB
-			 * on WC memory.
-			 */
-			context->bfs[j].buf_size = legacy_uar_map ? 0 : context->bf_reg_size / 2;
-			context->bfs[j].db_method = (context->bfs[j].need_lock &&  !mlx5_single_threaded) ?
-						    MLX5_DB_METHOD_BF :
-						    (mlx5_single_threaded && wc_auto_evict_size() == 64 ?
-						     MLX5_DB_METHOD_DEDIC_BF_1_THREAD :
-						     MLX5_DB_METHOD_DEDIC_BF);
+	for (i = 0; i < num_sys_page_map; i++) {
+		for (j = 0; j < context->num_uars_per_page; j++) {
+			for (k = 0; k < NUM_BFREGS_PER_UAR; k++) {
+				bfi = (i * context->num_uars_per_page + j) * NUM_BFREGS_PER_UAR + k;
+				context->bfs[bfi].reg = context->uar[i].regs + MLX5_ADAPTER_PAGE_SIZE * j +
+							MLX5_BF_OFFSET + k * context->bf_reg_size;
+				context->bfs[bfi].need_lock = need_uuar_lock(context, bfi) &&
+					    context->uar[i].map_type == MLX5_UAR_MAP_WC;
+				mlx5_lock_init(&context->bfs[bfi].lock,
+					       !mlx5_single_threaded,
+					       mlx5_get_locktype());
+				context->bfs[bfi].offset = 0;
+				if (bfi)
+					context->bfs[bfi].buf_size = context->bf_reg_size / 2;
 
-		} else {
-			context->bfs[j].db_method = MLX5_DB_METHOD_DB;
+				if (context->uar[i].map_type == MLX5_UAR_MAP_WC) {
+					/* In case of legacy mapping we don't know if UAR
+					 * mapped as NC or WC. To be on the safe side we assume
+					 * mapping as WC but BF buf_size = 0 this will force DB
+					 * on WC memory.
+					 */
+					context->bfs[bfi].buf_size = legacy_uar_map ? 0 : context->bf_reg_size / 2;
+					context->bfs[bfi].db_method = (context->bfs[bfi].need_lock &&  !mlx5_single_threaded) ?
+								       MLX5_DB_METHOD_BF :
+								       (mlx5_single_threaded && wc_auto_evict_size() == 64 ?
+								        MLX5_DB_METHOD_DEDIC_BF_1_THREAD :
+								        MLX5_DB_METHOD_DEDIC_BF);
+				} else {
+					context->bfs[bfi].db_method = MLX5_DB_METHOD_DB;
+				}
+
+				context->bfs[bfi].uuarn = bfi;
+			}
 		}
-
-		context->bfs[j].uuarn = j;
 	}
 
 	mlx5_lock_init(&context->lock32,
@@ -954,15 +1171,17 @@ err_free_cc:
 	if (context->cc.buf)
 		munmap(context->cc.buf, 4096 * context->num_ports);
 
+	if (context->clock_info_page)
+		munmap(context->clock_info_page, to_mdev(ibdev)->page_size);
+
 	if (context->hca_core_clock)
 		munmap(context->hca_core_clock - context->core_clock.offset,
 		       to_mdev(ibdev)->page_size);
 
-err_free_bf:
 	free(context->bfs);
 
 err_free:
-	for (i = 0; i < MLX5_MAX_UAR_PAGES; ++i) {
+	for (i = 0; i < MLX5_MAX_UARS; ++i) {
 		if (context->uar[i].regs)
 			munmap(context->uar[i].regs, page_size);
 	}
@@ -979,6 +1198,10 @@ static void mlx5_free_context(struct verbs_device *device,
 	int i;
 	struct mlx5_wc_uar *wc_uar;
 
+	if (context->clock_info_page)
+		munmap(context->clock_info_page,
+		       to_mdev(&device->device)->page_size);
+
 	if (context->hca_core_clock)
 		munmap(context->hca_core_clock - context->core_clock.offset,
 		       to_mdev(&device->device)->page_size);
@@ -987,7 +1210,7 @@ static void mlx5_free_context(struct verbs_device *device,
 		munmap(context->cc.buf, 4096 * context->num_ports);
 
 	free(context->bfs);
-	for (i = 0; i < MLX5_MAX_UAR_PAGES; ++i) {
+	for (i = 0; i < MLX5_MAX_UARS; ++i) {
 		if (context->uar[i].regs)
 			munmap(context->uar[i].regs, page_size);
 	}
@@ -997,6 +1220,7 @@ static void mlx5_free_context(struct verbs_device *device,
 		while (!list_empty(&context->wc_uar_list)) {
 			wc_uar = list_entry(context->wc_uar_list.next,
 					    struct mlx5_wc_uar, list);
+			munmap(wc_uar->uar, page_size);
 			list_del(&wc_uar->list);
 			free(wc_uar);
 		}

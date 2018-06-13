@@ -51,7 +51,24 @@
 #define MLX5_EC_MAX_WQE_BBS	11
 
 #define MLX5_CHUNK_SIZE(calc)	64 * (1 << calc->log_chunk_size)
-#define MLX5_EC_NOUTPUTS(m)	(m == 3 ? 4 : m)
+#define MLX5_EC_NUM_OUTPUTS     4
+#define MLX5_EC_NOUTPUTS(m)	((m) == 3 ? MLX5_EC_NUM_OUTPUTS : (m))
+#define MLX5_EC_MULT_NUM(m)	(((m) + MLX5_EC_NUM_OUTPUTS - 1) / \
+				MLX5_EC_NUM_OUTPUTS)
+/*
+ * use to calculate number of columnes in the last encode matrix, when m > 4
+ */
+#define MLX5_EC_LAST_COLS(m)	((m) % MLX5_EC_NUM_OUTPUTS ? \
+			(m) % MLX5_EC_NUM_OUTPUTS : MLX5_EC_NUM_OUTPUTS)
+/*
+ * calculate number of columns in encode matrix idx
+ * idx - index of matrix,
+ * num_matrices - number of encode matrices,
+ * m - total number of columns in all the encode matrices
+ */
+#define MLX5_EC_COLS(idx, num_matrices, m) \
+	((idx) == (num_matrices) - 1 ? \
+	(MLX5_EC_LAST_COLS(m)) : MLX5_EC_NUM_OUTPUTS)
 #define EC_BEACON_WRID		0xfffffffffffffffeULL
 
 struct mlx5_ec_mat {
@@ -81,6 +98,23 @@ struct mlx5_ec_comp_pool {
 	struct list_head	list;
 };
 
+struct mlx5_ec_multi_comp {
+	struct ibv_exp_ec_comp  comp;
+	struct ibv_exp_ec_comp  *orig_comp;
+	int			counter;
+	pthread_mutex_t         mutex;
+	struct mlx5_ec_calc	*calc;
+	/* needed in update flow */
+	struct ibv_sge          *data_update;
+	struct list_head	node;
+};
+
+struct mlx5_ec_multi_comp_pool {
+	struct mlx5_lock		lock;
+	struct mlx5_ec_multi_comp	*comps;
+	struct list_head		list;
+};
+
 struct mlx5_ec_calc {
 	struct ibv_exp_ec_calc	ibcalc;
 	struct ibv_pd		*pd;
@@ -90,9 +124,13 @@ struct mlx5_ec_calc {
 	uint8_t			log_chunk_size;
 	uint16_t		cq_count;
 	uint8_t			*mat;
+	/* number of vector calc ops needed according to m */
+	int                     mult_num;
 	struct ibv_mr		*mat_mr;
+	uint8_t                 **matrices; /* encode matrices for m > 4 */
 	struct mlx5_ec_mat_pool mat_pool;
 	struct mlx5_ec_comp_pool comp_pool;
+	struct mlx5_ec_multi_comp_pool multi_comp_pool;
 	pthread_t		ec_poller;
 	int			stop_ec_poller;
 	uint8_t			*dump;
@@ -100,6 +138,7 @@ struct mlx5_ec_calc {
 	int			k;
 	int			m;
 	int			w;
+	int			user_max_inflight_calcs;
 	int			max_inflight_calcs;
 	int			polling;
 	pthread_mutex_t         beacon_mutex;
@@ -121,6 +160,12 @@ static inline struct mlx5_ec_sync_comp *
 to_mcomp(struct ibv_exp_ec_comp *ec_comp)
 {
 	return (void *)ec_comp - offsetof(struct mlx5_ec_sync_comp, comp);
+}
+
+static inline struct mlx5_ec_multi_comp *
+to_multicomp(struct ibv_exp_ec_comp *ec_comp)
+{
+	return (void *)ec_comp - offsetof(struct mlx5_ec_multi_comp, comp);
 }
 
 struct ibv_exp_ec_calc *

@@ -50,10 +50,6 @@
 #include "doorbell.h"
 
 enum {
-	MLX5_CQ_DOORBELL			= 0x20
-};
-
-enum {
 	CQ_OK					=  0,
 	CQ_EMPTY				= -1,
 	CQ_POLL_ERR				= -2
@@ -61,36 +57,6 @@ enum {
 
 #define MLX5_CQ_DB_REQ_NOT_SOL			(1 << 24)
 #define MLX5_CQ_DB_REQ_NOT			(0 << 24)
-
-enum {
-	MLX5_CQE_SYNDROME_LOCAL_LENGTH_ERR		= 0x01,
-	MLX5_CQE_SYNDROME_LOCAL_QP_OP_ERR		= 0x02,
-	MLX5_CQE_SYNDROME_LOCAL_PROT_ERR		= 0x04,
-	MLX5_CQE_SYNDROME_WR_FLUSH_ERR			= 0x05,
-	MLX5_CQE_SYNDROME_MW_BIND_ERR			= 0x06,
-	MLX5_CQE_SYNDROME_BAD_RESP_ERR			= 0x10,
-	MLX5_CQE_SYNDROME_LOCAL_ACCESS_ERR		= 0x11,
-	MLX5_CQE_SYNDROME_REMOTE_INVAL_REQ_ERR		= 0x12,
-	MLX5_CQE_SYNDROME_REMOTE_ACCESS_ERR		= 0x13,
-	MLX5_CQE_SYNDROME_REMOTE_OP_ERR			= 0x14,
-	MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR	= 0x15,
-	MLX5_CQE_SYNDROME_RNR_RETRY_EXC_ERR		= 0x16,
-	MLX5_CQE_SYNDROME_REMOTE_ABORTED_ERR		= 0x22,
-};
-
-enum {
-	MLX5_CQE_OWNER_MASK	= 1,
-	MLX5_CQE_REQ		= 0,
-	MLX5_CQE_RESP_WR_IMM	= 1,
-	MLX5_CQE_RESP_SEND	= 2,
-	MLX5_CQE_RESP_SEND_IMM	= 3,
-	MLX5_CQE_RESP_SEND_INV	= 4,
-	MLX5_CQE_RESIZE_CQ	= 5,
-	MLX5_CQE_SIG_ERR	= 12,
-	MLX5_CQE_REQ_ERR	= 13,
-	MLX5_CQE_RESP_ERR	= 14,
-	MLX5_CQE_INVALID	= 15,
-};
 
 enum {
 	MLX5_CQ_MODIFY_RESEIZE = 0,
@@ -103,18 +69,6 @@ enum {
 	MLX5_INLINE_DATA32_SEG	= 0x1,
 	MLX5_INLINE_DATA64_SEG	= 0x2,
 	MLX5_COMPRESSED		= 0x3,
-};
-
-enum {
-	MLX5_CQE_L2_OK	= 1 << 0,
-	MLX5_CQE_L3_OK	= 1 << 1,
-	MLX5_CQE_L4_OK	= 1 << 2,
-};
-
-enum {
-	MLX5_CQE_L3_HDR_TYPE_NONE	= 0x0,
-	MLX5_CQE_L3_HDR_TYPE_IPV6	= 0x4,
-	MLX5_CQE_L3_HDR_TYPE_IPV4	= 0x8,
 };
 
 enum {
@@ -137,18 +91,8 @@ enum {
 	MP_RQ_NUM_STRIDES_FIELD_SHIFT	= 16,
 };
 
-struct mlx5_err_cqe {
-	uint8_t		rsvd0[32];
-	uint32_t	srqn;
-	uint8_t		rsvd1[16];
-	uint8_t		hw_err_synd;
-	uint8_t		hw_synd_type;
-	uint8_t		vendor_err_synd;
-	uint8_t		syndrome;
-	uint32_t	s_wqe_opcode_qpn;
-	uint16_t	wqe_counter;
-	uint8_t		signature;
-	uint8_t		op_own;
+enum {
+	MLX5_TM_MAX_SYNC_DIFF = 0x3fff
 };
 
 int mlx5_stall_num_loop = 60;
@@ -527,6 +471,7 @@ static int is_responder(uint8_t opcode)
 	case MLX5_CQE_RESP_SEND_IMM:
 	case MLX5_CQE_RESP_SEND_INV:
 	case MLX5_CQE_RESP_ERR:
+	case MLX5_CQE_NO_PACKET:
 		return 1;
 	}
 
@@ -804,6 +749,163 @@ static inline struct mlx5_cqe64 *mlx5_acc_rx_decompress_cqe(struct mlx5_cq *cq, 
 	return &cq->next_decomp_cqe64;
 }
 
+static inline void handle_tm_list_op(struct ibv_exp_wc *wc,
+				     struct mlx5_cqe64 *cqe64,
+				     struct mlx5_srq *srq,
+				     uint64_t *exp_wc_flags)
+	__attribute__((always_inline));
+static inline void handle_tm_list_op(struct ibv_exp_wc *wc,
+				     struct mlx5_cqe64 *cqe64,
+				     struct mlx5_srq *srq,
+				     uint64_t *exp_wc_flags)
+{
+#ifdef MLX5_DEBUG
+	FILE *fp = to_mctx(srq->vsrq.srq.context)->dbg_fp;
+#endif
+	struct mlx5_srq_op *op;
+
+	mlx5_spin_lock(&srq->lock);
+	if (srq->op_tail == srq->op_head) {
+		mlx5_dbg(fp, MLX5_DBG_CQ, "got unexpected list op CQE\n");
+		wc->status = IBV_WC_GENERAL_ERR;
+		mlx5_spin_unlock(&srq->lock);
+		return;
+	}
+	op = srq->op + (srq->op_head++ &
+			(srq->cmd_qp->sq.wqe_cnt - 1));
+	if (op->tag) {
+		mlx5_tm_release_tag(srq, op->tag);
+		if (cqe64->app_op == MLX5_CQE_APP_OP_TM_REMOVE &&
+		    !(*exp_wc_flags & IBV_EXP_WC_TM_DEL_FAILED))
+			mlx5_tm_release_tag(srq, op->tag);
+		if (ntohs(cqe64->tm_cqe.hw_phase_cnt) !=
+		    op->tag->phase_cnt)
+			*exp_wc_flags |= IBV_EXP_WC_TM_SYNC_REQ;
+	}
+
+	srq->cmd_qp->sq.tail = op->wqe_head;
+	wc->wr_id = op->wr_id;
+
+	mlx5_spin_unlock(&srq->lock);
+}
+
+static const uint64_t tm_wc_flags[] = {
+	[MLX5_CQE_APP_OP_TM_EXPECTED]		  = IBV_EXP_WC_TM_DATA_VALID,
+	[MLX5_CQE_APP_OP_TM_CONSUMED]		  = IBV_EXP_WC_TM_MATCH,
+	[MLX5_CQE_APP_OP_TM_CONSUMED_SW_RDNV]     = IBV_EXP_WC_TM_MATCH,
+	[MLX5_CQE_APP_OP_TM_CONSUMED_MSG]	  = IBV_EXP_WC_TM_MATCH |
+						    IBV_EXP_WC_TM_DATA_VALID,
+	[MLX5_CQE_APP_OP_TM_CONSUMED_MSG_SW_RDNV] = IBV_EXP_WC_TM_MATCH |
+						    IBV_EXP_WC_TM_DATA_VALID,
+	[MLX5_CQE_APP_OP_TM_MSG_COMPLETION_CANCELED] = IBV_EXP_WC_TM_MATCH |
+						       IBV_EXP_WC_TM_DATA_VALID,
+};
+
+static inline void handle_tag_matching(struct ibv_exp_wc *wc,
+				       struct mlx5_cqe64 *cqe64,
+				       struct mlx5_srq *srq,
+				       uint64_t *exp_wc_flags)
+	__attribute__((always_inline));
+static inline void handle_tag_matching(struct ibv_exp_wc *wc,
+				       struct mlx5_cqe64 *cqe64,
+				       struct mlx5_srq *srq,
+				       uint64_t *exp_wc_flags)
+{
+	/* ibv_exp_tmh was defined by design based on PRM */
+	struct ibv_exp_tmh *tmh = (struct ibv_exp_tmh *)cqe64;
+#ifdef MLX5_DEBUG
+	FILE *fp = to_mctx(srq->vsrq.srq.context)->dbg_fp;
+#endif
+	struct mlx5_tag_entry *tag;
+
+	wc->status = IBV_WC_SUCCESS;
+	switch (cqe64->app_op) {
+	case MLX5_CQE_APP_OP_TM_CONSUMED_MSG_SW_RDNV:
+	case MLX5_CQE_APP_OP_TM_CONSUMED_SW_RDNV:
+	case MLX5_CQE_APP_OP_TM_MSG_COMPLETION_CANCELED:
+		*exp_wc_flags |= IBV_EXP_WC_TM_RNDV_INCOMPLETE;
+		/* fall through */
+
+	case MLX5_CQE_APP_OP_TM_CONSUMED_MSG:
+	case MLX5_CQE_APP_OP_TM_CONSUMED:
+	case MLX5_CQE_APP_OP_TM_EXPECTED:
+		mlx5_spin_lock(&srq->lock);
+		wc->byte_len = ntohl(cqe64->byte_cnt);
+		tag = &srq->tm_list[ntohs(cqe64->app_info)];
+		if (!tag->expect_cqe) {
+			mlx5_dbg(fp, MLX5_DBG_CQ, "got idx %d which wasn't added\n",
+				 ntohs(cqe64->app_info));
+			wc->status = IBV_WC_GENERAL_ERR;
+			mlx5_spin_unlock(&srq->lock);
+			return;
+		}
+		wc->wr_id = tag->wr_id;
+		wc->exp_opcode = IBV_EXP_WC_TM_RECV;
+		wc->tm_info.tag = ntohll(tmh->tag);
+		wc->tm_info.priv = ntohl(tmh->app_ctx);
+		*exp_wc_flags |= tm_wc_flags[cqe64->app_op];
+		if (cqe64->app_op != MLX5_CQE_APP_OP_TM_CONSUMED &&
+		    cqe64->app_op != MLX5_CQE_APP_OP_TM_CONSUMED_SW_RDNV)
+			mlx5_tm_release_tag(srq, tag);
+		/* inline scatter 32 not supported for TM */
+		if (cqe64->op_own & MLX5_INLINE_SCATTER_64) {
+			if (ntohl(cqe64->byte_cnt) > tag->size)
+				wc->status = IBV_WC_LOC_LEN_ERR;
+			else
+				memcpy(tag->ptr, cqe64 - 1,
+				       ntohl(cqe64->byte_cnt));
+		}
+		if ((cqe64->op_own >> 4) == MLX5_CQE_RESP_SEND_IMM) {
+			*exp_wc_flags |= IBV_EXP_WC_WITH_IMM;
+			wc->imm_data = cqe64->imm_inval_pkey;
+		}
+
+		mlx5_spin_unlock(&srq->lock);
+		break;
+
+	case MLX5_CQE_APP_OP_TM_APPEND:
+		wc->exp_opcode = IBV_EXP_WC_TM_ADD;
+		handle_tm_list_op(wc, cqe64, srq, exp_wc_flags);
+		break;
+
+	case MLX5_CQE_APP_OP_TM_REMOVE:
+		wc->exp_opcode = IBV_EXP_WC_TM_DEL;
+		if (!(ntohl(cqe64->tm_cqe.success) & MLX5_TMC_SUCCESS))
+			*exp_wc_flags |= IBV_EXP_WC_TM_DEL_FAILED;
+		handle_tm_list_op(wc, cqe64, srq, exp_wc_flags);
+		break;
+
+	case MLX5_CQE_APP_OP_TM_NOOP:
+		wc->exp_opcode = IBV_EXP_WC_TM_SYNC;
+		handle_tm_list_op(wc, cqe64, srq, exp_wc_flags);
+		break;
+
+	case MLX5_CQE_APP_OP_TM_NO_TAG:
+		wc->status = handle_responder((struct ibv_wc *)wc, cqe64, NULL,
+					      srq, MLX5_RSC_TYPE_XSRQ,
+					      exp_wc_flags);
+		wc->exp_opcode = IBV_EXP_WC_TM_NO_TAG;
+		break;
+
+	case MLX5_CQE_APP_OP_TM_UNEXPECTED:
+		srq->unexp_in++;
+		if (srq->unexp_in - srq->unexp_out > MLX5_TM_MAX_SYNC_DIFF)
+			*exp_wc_flags |= IBV_EXP_WC_TM_SYNC_REQ;
+
+		wc->status = handle_responder((struct ibv_wc *)wc, cqe64, NULL,
+					      srq, MLX5_RSC_TYPE_XSRQ,
+					      exp_wc_flags);
+		wc->exp_opcode = IBV_EXP_WC_TM_RECV;
+		break;
+	}
+}
+
+static inline int is_odp_pfault_err(struct mlx5_err_cqe *ecqe)
+{
+	return ecqe->syndrome == MLX5_CQE_SYNDROME_REMOTE_ABORTED_ERR &&
+	       ecqe->vendor_err_synd == MLX5_CQE_VENDOR_SYNDROME_ODP_PFAULT;
+}
+
 static inline int mlx5_poll_one(struct mlx5_cq *cq,
 				struct mlx5_resource **cur_rsc,
 				struct mlx5_srq **cur_srq, struct ibv_exp_wc *wc,
@@ -840,6 +942,7 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	int timestamp_en = cq->creation_flags &
 		MLX5_CQ_CREATION_FLAG_COMPLETION_TIMESTAMP;
 
+repoll:
 	cqe64 = get_next_cqe(cq, cq->cqe_sz);
 	if (!cqe64)
 		return CQ_EMPTY;
@@ -973,6 +1076,14 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	case MLX5_CQE_RESP_SEND:
 	case MLX5_CQE_RESP_SEND_IMM:
 	case MLX5_CQE_RESP_SEND_INV:
+		if (cqe64->app == MLX5_CQE_APP_TAG_MATCHING) {
+			if (!is_srq)
+				return CQ_POLL_ERR;
+
+			handle_tag_matching(wc, cqe64, *cur_srq, &exp_wc_flags);
+			break;
+		}
+
 		wc->status = handle_responder((struct ibv_wc *)wc, cqe64, mqp,
 					      is_srq ? *cur_srq : NULL, type,
 					      &exp_wc_flags);
@@ -990,6 +1101,13 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 				 (uint64_t)IBV_EXP_WC_RX_IPV6_PACKET);
 		}
 		break;
+
+	case MLX5_CQE_NO_PACKET:
+		if (cqe64->app != MLX5_CQE_APP_TAG_MATCHING || !is_srq)
+			return CQ_POLL_ERR;
+		handle_tag_matching(wc, cqe64, *cur_srq, &exp_wc_flags);
+		break;
+
 	case MLX5_CQE_RESIZE_CQ:
 		break;
 	case MLX5_CQE_REQ_ERR:
@@ -999,7 +1117,8 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 		ecqe = (struct mlx5_err_cqe *)cqe64;
 		mlx5_handle_error_cqe(ecqe, wc);
 		mlx5_set_bad_wc_opcode(wc, ecqe, (opcode == MLX5_CQE_REQ_ERR), &is_umr);
-		if (unlikely(ecqe->syndrome != MLX5_CQE_SYNDROME_WR_FLUSH_ERR &&
+		if (unlikely(!is_odp_pfault_err(ecqe) &&
+			     ecqe->syndrome != MLX5_CQE_SYNDROME_WR_FLUSH_ERR &&
 			     ecqe->syndrome != MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR)) {
 			FILE *fp = mctx->dbg_fp;
 			fprintf(fp, PFX "%s: got completion with error:\n",
@@ -1023,6 +1142,12 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 		} else {
 			if (*cur_srq) {
 				wqe_ctr = ntohs(cqe64->wqe_counter);
+
+				if (is_odp_pfault_err(ecqe)) {
+					mlx5_requeue_srq_wqe(*cur_srq, wqe_ctr);
+					goto repoll;
+				}
+
 				wc->wr_id = (*cur_srq)->wrid[wqe_ctr];
 				mlx5_free_srq_wqe(*cur_srq, wqe_ctr);
 			} else {
@@ -1302,7 +1427,7 @@ void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t rsn_uidx, struct mlx5_srq *srq
 	uint8_t owner_bit;
 	int cqe_version;
 
-	if (!cq)
+	if (!cq || cq->model_flags & MLX5_CQ_MODEL_FLAG_DV_OWNED)
 		return;
 
 	/*
@@ -1598,14 +1723,16 @@ static inline int32_t get_rx_offloads_flags(struct mlx5_cqe64 *cqe)
 	return flags;
 }
 
-static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
-				  const int use_lock, const int cqe_sz,
-				  uint32_t *offset, uint32_t *flags,
-				  const int cqe_ver, uint16_t *vlan_cti) __attribute__((always_inline));
-static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
-				  const int use_lock, const int cqe_sz,
-				  uint32_t *offset, uint32_t *flags,
-				  const int cqe_ver, uint16_t *vlan_cti)
+static inline int32_t __poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
+				    const int use_lock, const int cqe_sz,
+				    uint32_t *offset, uint32_t *flags,
+				    const int cqe_ver, uint16_t *vlan_cti,
+				    uint64_t *timestamp) __attribute__((always_inline));
+static inline int32_t __poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
+				    const int use_lock, const int cqe_sz,
+				    uint32_t *offset, uint32_t *flags,
+				    const int cqe_ver, uint16_t *vlan_cti,
+				    uint64_t *timestamp)
 {
 	struct mlx5_cq *cq = to_mcq(ibcq);
 	struct mlx5_resource *cur_rsc = NULL;
@@ -1617,6 +1744,8 @@ static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
 	uint16_t wqe_ctr;
 	int err = CQ_OK;
 	int cqe_format;
+	int timestamp_en = timestamp && (cq->creation_flags &
+		MLX5_CQ_CREATION_FLAG_COMPLETION_TIMESTAMP);
 #ifdef MLX5_DEBUG
 	FILE *fp = to_mctx(ibcq->context)->dbg_fp;
 #endif
@@ -1632,6 +1761,7 @@ static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
 			cqe64 = mlx5_acc_rx_decompress_cqe(cq, &byte_cnt);
 			cqe_format = 0;
 			cur_rsc = cq->compressed_rsc;
+			timestamp_en = 0;
 		} else {
 			if (unlikely((cqe64->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
 				if (cqe64->op_own >> 4 == MLX5_CQE_RESP_ERR)
@@ -1745,6 +1875,11 @@ static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
 				++rwq->rq.tail;
 		}
 
+		if (timestamp_en) {
+			*timestamp = ntohll(cqe64->timestamp);
+			*flags |= IBV_EXP_CQ_RX_WITH_TIMESTAMP;
+		}
+
 		/* if CVLAN stripping is enabled, check the CQE CV bit */
 		if (vlan_cti) {
 		       if (cqe64->l4_hdr_type_etc & 0x1) {
@@ -1766,6 +1901,19 @@ out:
 		mlx5_unlock(&cq->lock);
 
 	return err == CQ_POLL_ERR ? -1 : size;
+}
+
+static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
+				    const int use_lock, const int cqe_sz,
+				    uint32_t *offset, uint32_t *flags,
+				    const int cqe_ver, uint16_t *vlan_cti) __attribute__((always_inline));
+static inline int32_t poll_length(struct ibv_cq *ibcq, void *buf, uint32_t *inl,
+				    const int use_lock, const int cqe_sz,
+				    uint32_t *offset, uint32_t *flags,
+				    const int cqe_ver, uint16_t *vlan_cti)
+{
+	return __poll_length(ibcq, buf, inl, use_lock, cqe_sz,
+			     offset, flags, cqe_ver, vlan_cti, NULL);
 }
 
 int32_t mlx5_poll_cnt_safe(struct ibv_cq *ibcq, uint32_t max) __MLX5_ALGN_F__;
@@ -1974,13 +2122,192 @@ int32_t mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe128_v1(struct ibv_cq *cq, u
 	return poll_length(cq, NULL, NULL, 0, 128, offset, flags, 1, vlan_cti);
 }
 
+/* Poll length flags timestamp */
+int32_t mlx5_poll_length_flags_ts_safe(struct ibv_cq *ibcq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_ts_safe(struct ibv_cq *ibcq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp)
+{
+	struct mlx5_cq *cq = to_mcq(ibcq);
+	struct mlx5_context *mctx = to_mctx(cq->ibv_cq.context);
+
+	return __poll_length(ibcq, buf, inl, 1, cq->cqe_sz, NULL, flags,
+			     mctx->cqe_version == 1, NULL, timestamp);
+}
+
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe64(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe64(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 64, NULL, flags, 0, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe128(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe128(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 128, NULL, flags, 0, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe64_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe64_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 64, NULL, flags, 1, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe128_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_ts_unsafe_cqe128_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 128, NULL, flags, 1, NULL,
+			     timestamp);
+}
+
+/* Poll length flags MP RQ timestamp */
+int32_t mlx5_poll_length_flags_mp_rq_ts_safe(struct ibv_cq *ibcq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_ts_safe(struct ibv_cq *ibcq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp)
+{
+	struct mlx5_cq *cq = to_mcq(ibcq);
+	struct mlx5_context *mctx = to_mctx(cq->ibv_cq.context);
+
+	return __poll_length(ibcq, NULL, NULL, 1, cq->cqe_sz, offset, flags,
+			     mctx->cqe_version == 1, NULL, timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 64, offset, flags, 0, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 128, offset, flags, 0, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 64, offset, flags, 1, NULL,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 128, offset, flags, 1, NULL,
+			     timestamp);
+}
+
+/* Poll length flags cvlan timestamp */
+int32_t mlx5_poll_length_flags_cvlan_ts_safe(struct ibv_cq *ibcq, void *buf, uint32_t *inl, uint32_t *flags,
+					     uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_cvlan_ts_safe(struct ibv_cq *ibcq, void *buf, uint32_t *inl, uint32_t *flags,
+					     uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	struct mlx5_cq *cq = to_mcq(ibcq);
+	struct mlx5_context *mctx = to_mctx(cq->ibv_cq.context);
+
+	return __poll_length(ibcq, buf, inl, 1, cq->cqe_sz, NULL, flags,
+			     mctx->cqe_version == 1, vlan_cti, timestamp);
+}
+
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+						     uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+						     uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 64, NULL, flags, 0, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+						      uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+						      uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 128, NULL, flags, 0, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+							uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+							uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 64, NULL, flags, 1, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+							 uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128_v1(struct ibv_cq *cq, void *buf, uint32_t *inl, uint32_t *flags,
+							 uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, buf, inl, 0, 128, NULL, flags, 1, vlan_cti,
+			     timestamp);
+}
+
+/* Poll length flags cvlan timestamp MP RQ */
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_safe(struct ibv_cq *ibcq, uint32_t *offset, uint32_t *flags,
+						   uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_safe(struct ibv_cq *ibcq, uint32_t *offset, uint32_t *flags,
+						   uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	struct mlx5_cq *cq = to_mcq(ibcq);
+	struct mlx5_context *mctx = to_mctx(cq->ibv_cq.context);
+
+	return __poll_length(ibcq, NULL, NULL, 1, cq->cqe_sz, offset, flags,
+			     mctx->cqe_version == 1, vlan_cti, timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							   uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							   uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 64, offset, flags, 0, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							    uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							    uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 128, offset, flags, 0, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							      uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							      uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 64, offset, flags, 1, vlan_cti,
+			     timestamp);
+}
+
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							       uint16_t *vlan_cti, uint64_t *timestamp) __MLX5_ALGN_F__;
+int32_t mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128_v1(struct ibv_cq *cq, uint32_t *offset, uint32_t *flags,
+							       uint16_t *vlan_cti, uint64_t *timestamp)
+{
+	return __poll_length(cq, NULL, NULL, 0, 128, offset, flags, 1, vlan_cti,
+			     timestamp);
+}
 static struct ibv_exp_cq_family_v1 mlx5_poll_cq_family_safe = {
 	.poll_cnt = mlx5_poll_cnt_safe,
 	.poll_length = mlx5_poll_length_safe,
 	.poll_length_flags = mlx5_poll_length_flags_safe,
 	.poll_length_flags_mp_rq = mlx5_poll_length_flags_mp_rq_safe,
 	.poll_length_flags_cvlan = mlx5_poll_length_flags_cvlan_safe,
-	.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_safe
+	.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_safe,
+	.poll_length_flags_ts = mlx5_poll_length_flags_ts_safe,
+	.poll_length_flags_mp_rq_ts = mlx5_poll_length_flags_mp_rq_ts_safe,
+	.poll_length_flags_cvlan_ts = mlx5_poll_length_flags_cvlan_ts_safe,
+	.poll_length_flags_mp_rq_cvlan_ts = mlx5_poll_length_flags_mp_rq_cvlan_ts_safe,
 };
 
 enum mlx5_poll_cq_cqe_sizes {
@@ -1996,7 +2323,11 @@ static struct ibv_exp_cq_family_v1 mlx5_poll_cq_family_unsafe_tbl[MLX5_POLL_CQ_N
 				.poll_length_flags = mlx5_poll_length_flags_unsafe_cqe64,
 				.poll_length_flags_mp_rq = mlx5_poll_length_flags_mp_rq_unsafe_cqe64,
 				.poll_length_flags_cvlan = mlx5_poll_length_flags_cvlan_unsafe_cqe64,
-				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe64
+				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe64,
+				.poll_length_flags_ts = mlx5_poll_length_flags_ts_unsafe_cqe64,
+				.poll_length_flags_mp_rq_ts = mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64,
+				.poll_length_flags_cvlan_ts = mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64,
+				.poll_length_flags_mp_rq_cvlan_ts = mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64,
 
 		},
 		[MLX5_POLL_CQ_CQE_128] = {
@@ -2005,7 +2336,11 @@ static struct ibv_exp_cq_family_v1 mlx5_poll_cq_family_unsafe_tbl[MLX5_POLL_CQ_N
 				.poll_length_flags = mlx5_poll_length_flags_unsafe_cqe128,
 				.poll_length_flags_mp_rq = mlx5_poll_length_flags_mp_rq_unsafe_cqe128,
 				.poll_length_flags_cvlan = mlx5_poll_length_flags_cvlan_unsafe_cqe128,
-				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe128
+				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe128,
+				.poll_length_flags_ts = mlx5_poll_length_flags_ts_unsafe_cqe128,
+				.poll_length_flags_mp_rq_ts = mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128,
+				.poll_length_flags_cvlan_ts = mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128,
+				.poll_length_flags_mp_rq_cvlan_ts = mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128,
 
 		},
 };
@@ -2017,7 +2352,11 @@ static struct ibv_exp_cq_family_v1 mlx5_poll_cq_family_unsafe_v1_tbl[MLX5_POLL_C
 				.poll_length_flags = mlx5_poll_length_flags_unsafe_cqe64_v1,
 				.poll_length_flags_mp_rq = mlx5_poll_length_flags_mp_rq_unsafe_cqe64_v1,
 				.poll_length_flags_cvlan = mlx5_poll_length_flags_cvlan_unsafe_cqe64_v1,
-				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe64_v1
+				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe64_v1,
+				.poll_length_flags_ts = mlx5_poll_length_flags_ts_unsafe_cqe64_v1,
+				.poll_length_flags_mp_rq_ts = mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe64_v1,
+				.poll_length_flags_cvlan_ts = mlx5_poll_length_flags_cvlan_ts_unsafe_cqe64_v1,
+				.poll_length_flags_mp_rq_cvlan_ts = mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe64_v1,
 		},
 		[MLX5_POLL_CQ_CQE_128] = {
 				.poll_cnt = mlx5_poll_cnt_unsafe_cqe128_v1,
@@ -2025,7 +2364,11 @@ static struct ibv_exp_cq_family_v1 mlx5_poll_cq_family_unsafe_v1_tbl[MLX5_POLL_C
 				.poll_length_flags = mlx5_poll_length_flags_unsafe_cqe128_v1,
 				.poll_length_flags_mp_rq = mlx5_poll_length_flags_mp_rq_unsafe_cqe128_v1,
 				.poll_length_flags_cvlan = mlx5_poll_length_flags_cvlan_unsafe_cqe128_v1,
-				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe128_v1
+				.poll_length_flags_mp_rq_cvlan = mlx5_poll_length_flags_mp_rq_cvlan_unsafe_cqe128_v1,
+				.poll_length_flags_ts = mlx5_poll_length_flags_ts_unsafe_cqe128_v1,
+				.poll_length_flags_mp_rq_ts = mlx5_poll_length_flags_mp_rq_ts_unsafe_cqe128_v1,
+				.poll_length_flags_cvlan_ts = mlx5_poll_length_flags_cvlan_ts_unsafe_cqe128_v1,
+				.poll_length_flags_mp_rq_cvlan_ts = mlx5_poll_length_flags_mp_rq_cvlan_ts_unsafe_cqe128_v1,
 		},
 };
 

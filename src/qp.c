@@ -91,6 +91,12 @@ enum {
 	MLX5_CALC_UINT64_XOR    = 0x06
 };
 
+enum {
+	MLX5_TM_OPCODE_NOP		= 0x00,
+	MLX5_TM_OPCODE_APPEND		= 0x01,
+	MLX5_TM_OPCODE_REMOVE		= 0x02
+};
+
 static const struct mlx5_calc_op {
 	int valid;
 	uint8_t opmod;
@@ -383,6 +389,26 @@ static inline void set_raddr_seg(struct mlx5_wqe_raddr_seg *rseg,
 	rseg->reserved = 0;
 }
 
+static void set_tm_seg(struct mlx5_wqe_tm_seg *tmseg, int op,
+		       struct ibv_exp_ops_wr *wr, int index)
+{
+	tmseg->flags = 0;
+	if (wr->flags & IBV_EXP_OPS_SIGNALED)
+		tmseg->flags |= MLX5_SRQ_FLAG_TM_CQE_REQ;
+	if (wr->flags & IBV_EXP_OPS_TM_SYNC) {
+		tmseg->flags |= MLX5_SRQ_FLAG_TM_SW_CNT;
+		tmseg->sw_cnt = htons(wr->tm.unexpected_cnt);
+	}
+	tmseg->opcode = op << 4;
+	if (op == MLX5_TM_OPCODE_NOP)
+		return;
+	tmseg->index = htons(index);
+	if (op == MLX5_TM_OPCODE_REMOVE)
+		return;
+	tmseg->append_tag = htonll(wr->tm.add.tag);
+	tmseg->append_mask = htonll(wr->tm.add.mask);
+}
+
 static void set_atomic_seg(struct mlx5_wqe_atomic_seg *aseg,
 			   enum ibv_wr_opcode   opcode,
 			   uint64_t swap,
@@ -400,6 +426,28 @@ static void set_atomic_seg(struct mlx5_wqe_atomic_seg *aseg,
 static int has_grh(struct mlx5_ah *ah)
 {
 	return ah->av.base.dqp_dct & ntohl(MLX5_EXTENDED_UD_AV);
+}
+
+static int set_ipoib_datagram_seg(struct mlx5_wqe_datagram_seg *dseg,
+				  struct ibv_exp_send_wr *wr)
+{
+	struct mlx5_ah *ah = to_mah(wr->wr.ud.ah);
+	int size;
+
+	size = sizeof(ah->av);
+
+	if (has_grh(ah)) {
+		memcpy(&dseg->av, &to_mah(wr->wr.ud.ah)->av, size);
+	} else {
+		memcpy(&dseg->av, &to_mah(wr->wr.ud.ah)->av, sizeof(ah->av.base));
+		dseg->av.base.dqp_dct |= htonl(MLX5_EXTENDED_UD_AV);
+		dseg->av.grh_sec.grh_gid_fl = 0; /* no GRH */
+	}
+
+	dseg->av.base.dqp_dct |= htonl(wr->wr.ud.remote_qpn);
+	dseg->av.base.key.qkey.qkey = htonl(wr->wr.ud.remote_qkey);
+
+	return size;
 }
 
 static int set_datagram_seg(struct mlx5_wqe_datagram_seg *dseg,
@@ -472,6 +520,15 @@ static inline int set_data_ptr_seg(struct mlx5_wqe_data_seg *dseg, struct ibv_sg
 	dseg->addr       = htonll(sg->addr + offset);
 
 	return 0;
+}
+
+static inline void set_data_ptr_seg_end(struct mlx5_wqe_data_seg *dseg)
+	__attribute__((always_inline));
+static inline void set_data_ptr_seg_end(struct mlx5_wqe_data_seg *dseg)
+{
+	dseg->byte_count = 0;
+	dseg->lkey       = htonl(MLX5_INVALID_LKEY);
+	dseg->addr       = 0;
 }
 
 static uint32_t send_ieth(struct ibv_exp_send_wr *wr)
@@ -846,7 +903,7 @@ static int lay_umr(struct mlx5_qp *qp, struct ibv_exp_send_wr *wr,
 		buf = seg;
 	} else {
 		klm = to_klm(wr->ext_op.umr.memory_objects);
-		buf = klm->align_buf;
+		buf = klm->buf;
 	}
 
 	*reglen = 0;
@@ -1284,7 +1341,7 @@ static int __mlx5_post_send_one_raw_packet(struct ibv_exp_send_wr *wr,
 	int err = 0;
 	int size = 0;
 	int num_sge = wr->num_sge;
-	int inl_hdr_size = MLX5_ETH_INLINE_HEADER_SIZE;
+	int inl_hdr_size = to_mctx(qp->verbs_qp.qp.context)->eth_min_inline_size;
 	int inl_hdr_copy_size = 0;
 	int i = 0;
 	uint8_t fm_ce_se;
@@ -1309,31 +1366,45 @@ static int __mlx5_post_send_one_raw_packet(struct ibv_exp_send_wr *wr,
 		 * inline-headers of the ETH segment.
 		 */
 		if (likely(wr->sg_list[0].length >= MLX5_ETH_INLINE_HEADER_SIZE)) {
-			inl_hdr_copy_size = MLX5_ETH_INLINE_HEADER_SIZE;
+			inl_hdr_copy_size = inl_hdr_size;
 			memcpy(eseg->inline_hdr_start,
 			       (void *)(uintptr_t)wr->sg_list[0].addr,
 			       inl_hdr_copy_size);
 		} else {
-			for (i = 0; i < num_sge && inl_hdr_size > 0; ++i) {
+			int inl_hdr_size_left = inl_hdr_size;
+
+			for (i = 0; i < num_sge && inl_hdr_size_left > 0; ++i) {
 				inl_hdr_copy_size = min(wr->sg_list[i].length,
-							inl_hdr_size);
+							inl_hdr_size_left);
 				memcpy(eseg->inline_hdr_start +
-				       (MLX5_ETH_INLINE_HEADER_SIZE - inl_hdr_size),
+				       (MLX5_ETH_INLINE_HEADER_SIZE - inl_hdr_size_left),
 				       (void *)(uintptr_t)wr->sg_list[i].addr,
 				       inl_hdr_copy_size);
-				inl_hdr_size -= inl_hdr_copy_size;
+				inl_hdr_size_left -= inl_hdr_copy_size;
 			}
-			--i;
-			if (unlikely(inl_hdr_size)) {
+
+			if (i)
+				--i;
+
+			if (unlikely(inl_hdr_size_left)) {
 				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Ethernet headers < %d bytes\n",
 					 MLX5_ETH_INLINE_HEADER_SIZE);
 				return EINVAL;
 			}
 		}
 
-		seg += sizeof(struct mlx5_wqe_eth_seg);
-		size += sizeof(struct mlx5_wqe_eth_seg) / 16;
-		eseg->inline_hdr_sz = htons(MLX5_ETH_INLINE_HEADER_SIZE);
+		eseg->inline_hdr_sz = htons(inl_hdr_size);
+
+		/* The eth segment size depends on the device's min inline
+		 * header requirement which can be 0 or 18.
+		 * The basic eth segment always includes room for first 2
+		 * inline header bytes (even if copy size is 0) so the
+		 * additional seg size is adjusted accordingly.
+		 */
+		seg += (offsetof(struct mlx5_wqe_eth_seg, inline_hdr) +
+		       inl_hdr_size) & ~0xf;
+		size += (offsetof(struct mlx5_wqe_eth_seg, inline_hdr) +
+			inl_hdr_size) >> 4;
 
 		/* If we copied all the sge into the inline-headers, then we need to
 		 * start copying from the next sge into the data-segment.
@@ -1361,6 +1432,85 @@ static int __mlx5_post_send_one_raw_packet(struct ibv_exp_send_wr *wr,
 			 MLX5_IB_OPCODE_GET_OP(mlx5_ib_opcode[wr->exp_opcode]),
 			 qp->gen_data.scur_post, 0, size, fm_ce_se,
 			 send_ieth(wr));
+
+	qp->gen_data.fm_cache = 0;
+	*total_size = size;
+
+	return 0;
+}
+
+static int ____mlx5_post_send_one_underlay(struct ibv_exp_send_wr *wr,
+					   struct mlx5_qp *qp, uint64_t exp_send_flags, void *seg, int *total_size) __MLX5_ALGN_F__;
+static int ____mlx5_post_send_one_underlay(struct ibv_exp_send_wr *wr,
+					   struct mlx5_qp *qp, uint64_t exp_send_flags, void *seg, int *total_size)
+{
+	void *ctrl = seg;
+	int err = 0;
+	int size = 0;
+	int num_sge = wr->num_sge;
+	uint8_t fm_ce_se;
+	int tmp;
+	struct mlx5_wqe_eth_pad *pad;
+	struct mlx5_wqe_eth_seg *eseg;
+	int inl_hdr_copy_size;
+	int sg_start_entry = 0;
+	int is_inl = !!(exp_send_flags & IBV_EXP_SEND_INLINE);
+
+	if (unlikely(wr->exp_opcode == IBV_EXP_WR_SEND_WITH_IMM))
+		return EINVAL;
+
+	seg += sizeof(struct mlx5_wqe_ctrl_seg);
+	size = sizeof(struct mlx5_wqe_ctrl_seg) / 16;
+
+	tmp = set_ipoib_datagram_seg(seg, wr);
+	seg  += tmp;
+	size += (tmp >> 4);
+	if (unlikely((seg == qp->gen_data.sqend)))
+		seg = mlx5_get_send_wqe(qp, 0);
+
+	pad = seg;
+	memset(pad, 0, sizeof(struct mlx5_wqe_eth_pad));
+	seg += sizeof(struct mlx5_wqe_eth_pad);
+	size += sizeof(struct mlx5_wqe_eth_pad) / 16;
+	eseg = seg;
+	*((uint64_t *)eseg) = 0;
+	eseg->rsvd2 = 0;
+
+	if (exp_send_flags & IBV_EXP_SEND_IP_CSUM)
+		eseg->cs_flags = MLX5_ETH_WQE_L3_CSUM | MLX5_ETH_WQE_L4_CSUM;
+
+	if (likely(wr->sg_list[0].length >= MLX5_IPOIB_INLINE_MAX_HEADER_SIZE))
+		/* Copying the minimum required data unless inline mode is set */
+		inl_hdr_copy_size = is_inl ? MLX5_IPOIB_INLINE_MAX_HEADER_SIZE : MLX5_IPOIB_INLINE_MIN_HEADER_SIZE;
+	else {
+		inl_hdr_copy_size = MLX5_IPOIB_INLINE_MIN_HEADER_SIZE;
+		/* We expect at least 4 bytes as part of first entry to hold the IPoIB header */
+		if (unlikely(wr->sg_list[0].length < inl_hdr_copy_size))
+			return EINVAL;
+	}
+
+	memcpy(eseg->inline_hdr_start, (void *)(uintptr_t)wr->sg_list[0].addr,
+	       inl_hdr_copy_size);
+	eseg->inline_hdr_sz = htons(inl_hdr_copy_size);
+	size += sizeof(struct mlx5_wqe_eth_seg) / 16;
+	seg += sizeof(struct mlx5_wqe_eth_seg);
+
+	/* If we copied all the sge into the inline-headers, then we need to
+	 * start copying from the next sge into the data-segment.
+	 */
+	if (unlikely(wr->sg_list[0].length == inl_hdr_copy_size)) {
+		sg_start_entry++;
+		inl_hdr_copy_size = 0;
+	}
+
+	err = set_data_seg(qp, seg, &size, is_inl, num_sge, wr->sg_list, 0, sg_start_entry, inl_hdr_copy_size, 0);
+	if (unlikely(err))
+		return err;
+
+	fm_ce_se = qp->ctrl_seg.fm_ce_se_tbl[exp_send_flags & (IBV_SEND_SOLICITED | IBV_SEND_SIGNALED | IBV_SEND_FENCE)];
+	fm_ce_se |= get_fence(qp->gen_data.fm_cache, wr);
+	set_ctrl_seg_sig(ctrl, &qp->ctrl_seg, MLX5_IB_OPCODE_GET_OP(mlx5_ib_opcode[wr->exp_opcode]),
+			 qp->gen_data.scur_post, 0, size, fm_ce_se, send_ieth(wr));
 
 	qp->gen_data.fm_cache = 0;
 	*total_size = size;
@@ -1967,7 +2117,10 @@ void mlx5_update_post_send_one(struct mlx5_qp *qp, enum ibv_qp_state qp_state, e
 
 		case IBV_QPT_UC:
 		case IBV_QPT_UD:
-			qp->gen_data.post_send_one = __mlx5_post_send_one_uc_ud;
+			if (qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY)
+				qp->gen_data.post_send_one = ____mlx5_post_send_one_underlay;
+			else
+				qp->gen_data.post_send_one = __mlx5_post_send_one_uc_ud;
 			break;
 
 		case IBV_QPT_RAW_ETH:
@@ -2314,8 +2467,8 @@ out:
 		 */
 		wmb();
 
-		if (likely(!(ibqp->qp_type == IBV_QPT_RAW_ETH &&
-			     ibqp->state < IBV_QPS_RTR)))
+		if (likely(!((ibqp->qp_type == IBV_QPT_RAW_ETH ||
+			      qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) && ibqp->state < IBV_QPS_RTR)))
 			qp->gen_data.db[MLX5_RCV_DBR] = htonl(qp->rq.head & 0xffff);
 	}
 
@@ -3556,5 +3709,181 @@ struct ibv_exp_wq_family *mlx5_get_wq_family(struct mlx5_rwq *rwq,
 	*status = ret;
 
 	return family;
+}
+
+static void mlx5_tm_add_op(struct mlx5_srq *srq, struct mlx5_tag_entry *tag,
+			   uint64_t wr_id, int nreq)
+{
+	struct mlx5_qp *qp = srq->cmd_qp;
+	struct mlx5_srq_op *op;
+
+	op = srq->op + (srq->op_tail++ & (qp->sq.wqe_cnt - 1));
+	op->tag = tag;
+	op->wr_id = wr_id;
+	op->wqe_head = qp->sq.head + nreq + 1;
+	if (tag)
+		tag->expect_cqe++;
+}
+
+int mlx5_exp_post_srq_ops(struct ibv_srq *ibsrq, struct ibv_exp_ops_wr *wr,
+			  struct ibv_exp_ops_wr **bad_wr)
+{
+	struct mlx5_srq *srq = to_msrq(ibsrq);
+	struct mlx5_wqe_ctrl_seg *ctrl = NULL;
+	void *uninitialized_var(wqe2ring);
+	struct mlx5_tag_entry *tag;
+	struct mlx5_qp *qp;
+	unsigned int idx;
+	int size = 0;
+	int nreq = 0;
+	int err = 0;
+	void *qend;
+	void *seg;
+#ifdef MLX5_DEBUG
+	FILE *fp = to_mctx(ibsrq->context)->dbg_fp;
+#endif
+
+	if (unlikely(!srq->cmd_qp)) {
+		*bad_wr = wr;
+		return EINVAL;
+	}
+
+	mlx5_spin_lock(&srq->lock);
+	qp = srq->cmd_qp;
+	qend = qp->gen_data.sqend;
+
+	for (nreq = 0; wr; ++nreq, wr = wr->next) {
+		if (unlikely(mlx5_wq_overflow(0, nreq, qp))) {
+			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "work queue overflow\n");
+			err = ENOMEM;
+			*bad_wr = wr;
+			goto out;
+		}
+
+		idx = qp->gen_data.scur_post & (qp->sq.wqe_cnt - 1);
+		ctrl = seg = mlx5_get_send_wqe(qp, idx);
+		seg += sizeof(*ctrl);
+		size = sizeof(*ctrl) / 16;
+
+		switch (wr->opcode) {
+		case IBV_EXP_WR_TAG_ADD:
+			if (unlikely(!srq->tm_head->next)) {
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "tag matching list is full\n");
+				err = ENOMEM;
+				*bad_wr = wr;
+				goto out;
+			}
+			tag = srq->tm_head;
+#ifdef MLX5_DEBUG
+			if (wr->tm.add.num_sge > 1) {
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "num_sge must be at most 1\n");
+				err = EINVAL;
+				*bad_wr = wr;
+				goto out;
+			}
+
+			if (tag->expect_cqe) {
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "tag matching list is corrupted\n");
+				err = ENOMEM;
+				*bad_wr = wr;
+				goto out;
+			}
+#endif
+			srq->tm_head = tag->next;
+
+			set_tm_seg(seg, MLX5_TM_OPCODE_APPEND, wr,
+				   tag->next - srq->tm_list);
+			tag->next = NULL;
+			tag->wr_id = wr->tm.add.recv_wr_id;
+			if (wr->flags & IBV_EXP_OPS_TM_SYNC)
+				srq->unexp_out = wr->tm.unexpected_cnt;
+			tag->phase_cnt = srq->unexp_out;
+			tag->expect_cqe++;
+
+			if (wr->flags & IBV_EXP_OPS_SIGNALED)
+				mlx5_tm_add_op(srq, tag, wr->wr_id, nreq);
+
+			wr->tm.handle = tag - srq->tm_list;
+			seg += sizeof(struct mlx5_wqe_tm_seg);
+			size += sizeof(struct mlx5_wqe_tm_seg) / 16;
+
+			if (unlikely(seg == qend))
+				seg = mlx5_get_send_wqe(qp, 0);
+
+			if (wr->tm.add.num_sge && wr->tm.add.sg_list->length) {
+				set_data_ptr_seg(seg, wr->tm.add.sg_list,
+						 qp, 0);
+				tag->ptr = (void *)(uintptr_t)
+					wr->tm.add.sg_list->addr;
+				tag->size = wr->tm.add.sg_list->length;
+			} else {
+				set_data_ptr_seg_end(seg);
+			}
+			size += sizeof(struct mlx5_wqe_data_seg) / 16;
+			break;
+
+		case IBV_EXP_WR_TAG_DEL:
+			tag = &srq->tm_list[wr->tm.handle];
+
+#ifdef MLX5_DEBUG
+			if (!tag->expect_cqe) {
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "removing tag which wasn't added\n");
+				err = ENOMEM;
+				*bad_wr = wr;
+				goto out;
+			}
+#endif
+			set_tm_seg(seg, MLX5_TM_OPCODE_REMOVE, wr,
+				   wr->tm.handle);
+
+			if (wr->flags & IBV_EXP_OPS_SIGNALED)
+				mlx5_tm_add_op(srq, tag, wr->wr_id, nreq);
+			else
+				mlx5_tm_release_tag(srq, tag);
+
+			seg += sizeof(struct mlx5_wqe_tm_seg);
+			size += sizeof(struct mlx5_wqe_tm_seg) / 16;
+			break;
+
+		case IBV_EXP_WR_TAG_SYNC:
+			set_tm_seg(seg, MLX5_TM_OPCODE_NOP, wr, 0);
+
+			if (wr->flags & IBV_EXP_OPS_SIGNALED)
+				mlx5_tm_add_op(srq, NULL, wr->wr_id, nreq);
+
+			seg += sizeof(struct mlx5_wqe_tm_seg);
+			size += sizeof(struct mlx5_wqe_tm_seg) / 16;
+			break;
+
+		default:
+			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "bad opcode %d\n",
+				 wr->opcode);
+			err = EINVAL;
+			*bad_wr = wr;
+			goto out;
+		}
+
+		set_ctrl_seg((uint32_t *)ctrl, &qp->ctrl_seg,
+		     MLX5_OPCODE_TAG_MATCHING, qp->gen_data.scur_post,
+		     0, size, 0, 0);
+
+		qp->gen_data.scur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+		wqe2ring = ctrl;
+
+#ifdef MLX5_DEBUG
+		if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
+			dump_wqe(fp, idx, size, qp);
+#endif
+	}
+
+out:
+	if (likely(nreq)) {
+		qp->sq.head += nreq;
+		__ring_db(qp, qp->gen_data.bf->db_method, qp->gen_data.scur_post & 0xffff, wqe2ring, (size + 3) / 4);
+	}
+
+	mlx5_spin_unlock(&srq->lock);
+
+	return err;
 }
 

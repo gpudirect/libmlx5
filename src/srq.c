@@ -100,6 +100,50 @@ static void set_sig_seg(struct mlx5_srq *srq,
 	next->signature = ~sign;
 }
 
+/*
+ * - enqueue old WQE pointed by ind to free queue
+ * - dequeue new WQE and copy descriptors from old
+ * - pass WQE ownership to HW
+ */
+void mlx5_requeue_srq_wqe(struct mlx5_srq *srq, int ind)
+{
+	struct mlx5_wqe_srq_next_seg *head, *old, *tail;
+	struct mlx5_wqe_data_seg *head_scat, *old_scat;
+	int i;
+
+	mlx5_spin_lock(&srq->lock);
+
+	srq->wrid[srq->head] = srq->wrid[ind];
+
+	old = get_wqe(srq, ind);
+	tail = get_wqe(srq, srq->tail);
+	head = get_wqe(srq, srq->head);
+
+	tail->next_wqe_index = htons(ind);
+	srq->tail = ind;
+	ind = srq->head;
+	srq->head = ntohs(head->next_wqe_index);
+
+	old_scat = (struct mlx5_wqe_data_seg *)(old + 1);
+	head_scat = (struct mlx5_wqe_data_seg *)(head + 1);
+
+	for (i = 0; i < srq->max_gs; ++i) {
+		head_scat[i] = old_scat[i];
+		if (old_scat[i].lkey == htonl(MLX5_INVALID_LKEY))
+			break;
+	}
+
+	if (unlikely(srq->wq_sig))
+		set_sig_seg(srq, head, 1 << srq->wqe_shift, ind);
+
+	srq->counter++;
+	/* Flush descriptors */
+	wmb();
+	*srq->db = htonl(srq->counter);
+
+	mlx5_spin_unlock(&srq->lock);
+}
+
 int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 		       struct ibv_recv_wr *wr,
 		       struct ibv_recv_wr **bad_wr)
@@ -198,7 +242,7 @@ int mlx5_alloc_srq_buf(struct ibv_context *context, struct mlx5_srq *srq)
 
 	size = mlx5_round_up_power_of_two(size);
 
-	if (size > ctx->max_recv_wr) {
+	if (size > ctx->max_rq_desc_sz) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -231,6 +275,101 @@ int mlx5_alloc_srq_buf(struct ibv_context *context, struct mlx5_srq *srq)
 	srq->tail = srq->max - 1;
 
 	return 0;
+}
+
+static int srq_sig_enabled(struct ibv_context *context)
+{
+	char env[VERBS_MAX_ENV_VAL];
+
+	if (!ibv_exp_cmd_getenv(context, "MLX5_SRQ_SIGNATURE", env, sizeof(env)))
+		return 1;
+
+	return 0;
+}
+
+struct mlx5_srq *mlx5_alloc_srq(struct ibv_context *context,
+				struct ibv_srq_attr *attr)
+{
+	struct mlx5_context *ctx = to_mctx(context);
+	struct mlx5_srq	*srq;
+	int max_sge;
+#ifdef MLX5_DEBUG
+	FILE *fp = ctx->dbg_fp;
+#endif
+
+	srq = calloc(1, sizeof(*srq));
+	if (!srq)
+		return NULL;
+
+	if (mlx5_spinlock_init(&srq->lock, !mlx5_single_threaded)) {
+		mlx5_dbg(fp, MLX5_DBG_SRQ, "\n");
+		goto err;
+	}
+
+	if (attr->max_wr > ctx->max_srq_recv_wr) {
+		mlx5_dbg(fp, MLX5_DBG_SRQ, "max_wr %d, max_srq_recv_wr %d\n",
+			 attr->max_wr, ctx->max_srq_recv_wr);
+		errno = EINVAL;
+		goto err;
+	}
+
+	/*
+	 * this calculation does not consider required control segments. The
+	 * final calculation is done again later. This is done so to avoid
+	 * overflows of variables
+	 */
+	max_sge = ctx->max_recv_wr / sizeof(struct mlx5_wqe_data_seg);
+	if (attr->max_sge > max_sge) {
+		mlx5_dbg(fp, MLX5_DBG_SRQ, "max_sge %d > %d\n",
+			 attr->max_sge, max_sge);
+		errno = EINVAL;
+		goto err;
+	}
+
+	srq->max     = mlx5_round_up_power_of_two(attr->max_wr + 1);
+	srq->max_gs  = attr->max_sge;
+	srq->counter = 0;
+	srq->wq_sig  = srq_sig_enabled(context);
+
+	if (mlx5_alloc_srq_buf(context, srq)) {
+		mlx5_dbg(fp, MLX5_DBG_SRQ, "\n");
+		goto err;
+	}
+
+	attr->max_sge = srq->max_gs;
+
+	srq->db = mlx5_alloc_dbrec(ctx);
+	if (!srq->db) {
+		mlx5_dbg(fp, MLX5_DBG_SRQ, "\n");
+		goto err_free;
+	}
+
+	srq->db[MLX5_RCV_DBR] = 0;
+	srq->db[MLX5_SND_DBR] = 0;
+
+	return srq;
+
+err_free:
+	free(srq->wrid);
+	mlx5_free_buf(&srq->buf);
+
+err:
+	free(srq);
+
+	return NULL;
+}
+
+void mlx5_free_srq(struct ibv_context *context,
+		   struct mlx5_srq *srq)
+{
+	struct mlx5_context *ctx = to_mctx(context);
+
+	mlx5_free_db(ctx, srq->db);
+
+	free(srq->wrid);
+	mlx5_free_buf(&srq->buf);
+
+	free(srq);
 }
 
 struct mlx5_srq *mlx5_find_srq(struct mlx5_context *ctx, uint32_t srqn)

@@ -96,6 +96,30 @@ static inline void mlx5_write64(uint32_t val[2],
 	*dst++ = *src++
 
 #endif
+
+#if defined(__aarch64__)
+static void mlx5_bf_copy(unsigned long long *dst, unsigned long long *src,
+			 unsigned bytecnt, struct mlx5_qp *qp)
+{
+	volatile __uint128_t *to = (volatile __uint128_t *)dst;
+	__uint128_t *from = (__uint128_t *)src;
+	__uint128_t dw0, dw1, dw2, dw3;
+
+	while (bytecnt > 0) {
+		dw0 = *from++;
+		dw1 = *from++;
+		dw2 = *from++;
+		dw3 = *from++;
+		*to++ = dw0;
+		*to++ = dw1;
+		*to++ = dw2;
+		*to++ = dw3;
+		bytecnt -= 4 * sizeof(__uint128_t);
+		if (unlikely(from == qp->gen_data.sqend))
+			from = (__uint128_t *)(qp->gen_data.sqstart);
+	}
+}
+#else
 static void mlx5_bf_copy(unsigned long long *dst, unsigned long long *src,
 			 unsigned bytecnt, struct mlx5_qp *qp)
 {
@@ -106,6 +130,7 @@ static void mlx5_bf_copy(unsigned long long *dst, unsigned long long *src,
 			src = qp->gen_data.sqstart;
 	}
 }
+#endif
 
 static inline void mlx5_write_db(unsigned long long *dst, unsigned long long *src)
 {

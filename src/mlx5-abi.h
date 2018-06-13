@@ -44,15 +44,29 @@ enum {
 
 enum {
 	MLX5_RWQ_FLAG_SIGNATURE		  = 1 << 0,
+	MLX5_EXP_RWQ_FLAGS_DELAY_DROP	  = 1 << 29,
 	MLX5_EXP_RWQ_FLAGS_SCATTER_FCS	  = 1 << 30,
 	MLX5_EXP_RWQ_FLAGS_RX_END_PADDING = 1 << 31
 };
 
 enum {
-	MLX5_NUM_UUARS_PER_PAGE = 2,
-	MLX5_MAX_UAR_PAGES	= 1 << 8,
-	MLX5_MAX_UUARS		= MLX5_MAX_UAR_PAGES * MLX5_NUM_UUARS_PER_PAGE,
-	MLX5_DEF_TOT_UUARS	= 8 * MLX5_NUM_UUARS_PER_PAGE,
+	MLX5_NUM_NON_FP_BFREGS_PER_UAR	= 2,
+	NUM_BFREGS_PER_UAR		= 4,
+	MLX5_MAX_UARS			= 1 << 8,
+	MLX5_MAX_BFREGS			= MLX5_MAX_UARS * MLX5_NUM_NON_FP_BFREGS_PER_UAR,
+	MLX5_DEF_TOT_UUARS		= 8 * MLX5_NUM_NON_FP_BFREGS_PER_UAR,
+	MLX5_MED_BFREGS_TSHOLD		= 12,
+};
+
+enum mlx5_lib_caps {
+	MLX5_LIB_CAP_4K_UAR		= 1 << 0,
+};
+
+enum mlx5_inline_modes {
+	MLX5_INLINE_MODE_NONE,
+	MLX5_INLINE_MODE_L2,
+	MLX5_INLINE_MODE_IP,
+	MLX5_INLINE_MODE_TCP_UDP,
 };
 
 struct mlx5_alloc_ucontext {
@@ -65,6 +79,7 @@ struct mlx5_alloc_ucontext {
 	__u8				reserved0;
 	__u16				reserved1;
 	__u32				reserved2;
+	__u64				lib_caps;
 };
 
 struct mlx5_alloc_ucontext_resp {
@@ -86,6 +101,8 @@ struct mlx5_alloc_ucontext_resp {
 	__u8				cmds_supp_uhw;
 	__u16				reserved2;
 	__u64				hca_core_clock_offset;
+	__u32				log_uar_size;
+	__u32				num_uars_per_page;
 };
 
 struct mlx5_create_ah_resp {
@@ -103,14 +120,15 @@ enum mlx5_exp_alloc_context_resp_mask {
 	MLX5_EXP_ALLOC_CTX_RESP_MASK_HCA_CORE_CLOCK_OFFSET	= 1 << 4,
 	MLX5_EXP_ALLOC_CTX_RESP_MASK_MAX_DESC_SZ_SQ_DC		= 1 << 5,
 	MLX5_EXP_ALLOC_CTX_RESP_MASK_ATOMIC_SIZES_DC		= 1 << 6,
-	MLX5_EXP_ALLOC_CTX_RESP_MASK_FLAGS			= 1 << 7,
+	MLX5_EXP_ALLOC_CTX_RESP_MASK_FLAGS			= 1 << 8,
+	MLX5_EXP_ALLOC_CTX_RESP_MASK_CLOCK_INFO			= 1 << 7,
 };
 
 struct mlx5_exp_alloc_ucontext_data_resp {
 	__u32   comp_mask; /* use mlx5_exp_alloc_context_resp_mask */
 	__u16   cqe_comp_max_num;
 	__u8    cqe_version;
-	__u8    reserved;
+	__u8    clock_info_version_mask;
 	__u16	rroce_udp_sport_min;
 	__u16	rroce_udp_sport_max;
 	__u32	hca_core_clock_offset;
@@ -136,12 +154,15 @@ struct mlx5_exp_alloc_ucontext_resp {
 	__u32						response_length;
 	__u8						cqe_version;
 	__u8						cmds_supp_uhw;
-	__u16						reserved2;
+	__u8						eth_min_inline;
+	__u8						reserved2;
 	__u64						hca_core_clock_offset;
+	__u32						log_uar_size;
+	__u32						num_uars_per_page;
 
 	/* Some more reserved fields for future growth of
 	 * mlx5_alloc_ucontext_resp */
-	__u64						prefix_reserved3[10];
+	__u64						prefix_reserved3[9];
 
 	struct mlx5_exp_alloc_ucontext_data_resp	exp_data;
 };
@@ -234,7 +255,8 @@ enum mlx5_exp_drv_create_qp_mask {
 	MLX5_EXP_CREATE_QP_MASK_SQ_BUFF_ADD	= 1 << 1,
 	MLX5_EXP_CREATE_QP_MASK_WC_UAR_IDX	= 1 << 2,
 	MLX5_EXP_CREATE_QP_MASK_FLAGS_IDX	= 1 << 3,
-	MLX5_EXP_CREATE_QP_MASK_RESERVED	= 1 << 4,
+	MLX5_EXP_CREATE_QP_MASK_ASSOC_QPN	= 1 << 4,
+	MLX5_EXP_CREATE_QP_MASK_RESERVED	= 1 << 5,
 };
 
 enum mlx5_exp_create_qp_flags {
@@ -251,6 +273,8 @@ struct mlx5_exp_drv_create_qp_data {
 	__u64	sq_buf_addr;
 	__u32   wc_uar_index;
 	__u32   flags; /* use mlx5_exp_create_qp_flags */
+	__u32   associated_qpn;
+	__u32   reserved;
 };
 
 struct mlx5_exp_drv_create_qp {
@@ -462,6 +486,46 @@ struct mlx5_query_device_ex {
 
 struct mlx5_query_device_ex_resp {
 	struct ibv_query_device_resp_ex ibv_resp;
+};
+
+enum mlx5_exp_create_srq_mask {
+	MLX5_EXP_CREATE_SRQ_MASK_DC_OP	= 1 << 0,
+	MLX5_EXP_CREATE_SRQ_MASK_MP_WR	= 1 << 1,
+};
+
+struct mlx5_dc_offload_params {
+	__u16				pkey_index;
+	__u8				path_mtu;
+	__u8				sl;
+	__u8				max_rd_atomic;
+	__u8				min_rnr_timer;
+	__u8				timeout;
+	__u8				retry_cnt;
+	__u8				rnr_retry;
+	__u8				reserved2[3];
+	__u32				ooo_caps;
+	__u64				dct_key;
+};
+
+struct mlx5_exp_create_srq {
+	struct ibv_exp_create_srq	ibv_cmd;
+	__u64				buf_addr;
+	__u64				db_addr;
+	__u32				flags;
+	__u32				reserved0;
+	__u32				uidx;
+	__u8				mp_wr_log_num_of_strides;
+	__u8				mp_wr_log_stride_size;
+	__u16				reserved1;
+	__u32				max_num_tags;
+	__u32				comp_mask; /* use mlx5_exp_create_srq_mask */
+	struct mlx5_dc_offload_params	dc_op;
+};
+
+struct mlx5_exp_create_srq_resp {
+	struct ibv_exp_create_srq_resp	ibv_resp;
+	__u32				srqn;
+	__u32				reserved;
 };
 
 #endif /* MLX5_ABI_H */
