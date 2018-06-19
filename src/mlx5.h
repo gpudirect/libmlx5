@@ -792,6 +792,18 @@ enum mlx5_qp_flags {
 	MLX5_QP_FLAGS_USE_UNDERLAY = 0x01,
 };
 
+/* 
+ * Expose send ptr and size
+*/
+#define MLX5_QP_MAX_SWR_INFO 128
+
+struct mlx5_swr_info {
+	uint64_t wr_id;
+	uintptr_t ptr_to_size;
+	uintptr_t ptr_to_addr;
+	int offset;
+};
+
 struct mlx5_qp {
 	struct mlx5_resource		rsc;
 	struct verbs_qp			verbs_qp;
@@ -838,6 +850,11 @@ struct mlx5_qp {
 	struct ibv_exp_peer_buf		       *peer_db_buf;
 	uint32_t				max_tso_header;
 	uint32_t                                flags; /* Use enum mlx5_qp_flags */
+	/* Expose send params */
+	int 					save_swr_info;
+	int 					cur_swr;
+	struct mlx5_swr_info 			swr_info[MLX5_QP_MAX_SWR_INFO];
+
 };
 
 struct mlx5_dct {
@@ -1189,6 +1206,14 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr) __MLX5_ALGN_F__;
 int mlx5_exp_post_send(struct ibv_qp *ibqp, struct ibv_exp_send_wr *wr,
 		       struct ibv_exp_send_wr **bad_wr) __MLX5_ALGN_F__;
+
+//Expose send
+int mlx5_exp_post_send_info(struct ibv_qp *ibqp, struct ibv_exp_send_wr *wr,
+		       struct ibv_exp_send_wr **bad_wr) __MLX5_ALGN_F__;
+//Return type should be changed in a struct pointer!
+int mlx5_exp_query_send_info(struct ibv_qp *qp, uint64_t wr_id) __MLX5_ALGN_F__;
+
+
 struct ibv_exp_mkey_list_container *mlx5_alloc_mkey_mem(struct ibv_exp_mkey_list_container_attr *attr);
 int mlx5_free_mkey_mem(struct ibv_exp_mkey_list_container *mem);
 int mlx5_query_mkey(struct ibv_mr *mr, struct ibv_exp_mkey_attr *mkey_attr);

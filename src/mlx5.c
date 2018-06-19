@@ -632,6 +632,10 @@ static void set_experimental(struct ibv_context *ctx)
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_post_task, mlx5_post_task);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_reg_mr, mlx5_exp_reg_mr);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_post_send, mlx5_exp_post_send);
+	//Expose send
+	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_post_send_info, mlx5_exp_post_send_info);
+	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_send_info, mlx5_exp_query_send_info);
+	
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_alloc_mkey_list_memory, mlx5_alloc_mkey_mem);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_dealloc_mkey_list_memory, mlx5_free_mkey_mem);
 	verbs_set_exp_ctx_op(verbs_exp_ctx, drv_exp_query_mkey, mlx5_query_mkey);
