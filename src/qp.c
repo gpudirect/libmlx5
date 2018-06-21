@@ -633,7 +633,7 @@ static inline int set_data_non_inl_seg(struct mlx5_qp *qp, int num_sge, struct i
 			if(qp->save_swr_info == 1)
 			{
 				qp->swr_info[qp->cur_swr].ptr_to_size = (uintptr_t)(&(dpseg->byte_count));
-				qp->swr_info[qp->cur_swr].ptr_to_addr = qp->swr_info[qp->cur_swr].ptr_to_size + (2*sizeof(uint32_t)); //(uintptr_t)(&(dpseg->addr));
+				qp->swr_info[qp->cur_swr].ptr_to_addr = (uintptr_t)(&(dpseg->addr));
 				qp->swr_info[qp->cur_swr].offset = offset;
 			}
 
@@ -2400,7 +2400,6 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 			qp->swr_info[i].ptr_to_addr=0;
 			qp->cur_swr = 0;
 			ret=0;
-
 		}
 	}
 
