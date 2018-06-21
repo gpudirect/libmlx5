@@ -1209,9 +1209,9 @@ int mlx5_exp_post_send(struct ibv_qp *ibqp, struct ibv_exp_send_wr *wr,
 
 //Expose send
 int mlx5_exp_post_send_info(struct ibv_qp *ibqp, struct ibv_exp_send_wr *wr,
-		       struct ibv_exp_send_wr **bad_wr) __MLX5_ALGN_F__;
-//Return type should be changed in a struct pointer!
-int mlx5_exp_query_send_info(struct ibv_qp *qp, uint64_t wr_id) __MLX5_ALGN_F__;
+				struct ibv_exp_send_wr **bad_wr) __MLX5_ALGN_F__;
+int mlx5_exp_query_send_info(struct ibv_qp *qp, uint64_t wr_id, 
+				struct ibv_qp_swr_info * swr_info) __MLX5_ALGN_F__;
 
 
 struct ibv_exp_mkey_list_container *mlx5_alloc_mkey_mem(struct ibv_exp_mkey_list_container_attr *attr);

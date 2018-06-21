@@ -2295,25 +2295,31 @@ static inline int __mlx5_post_send_exp_info(struct ibv_qp *ibqp, struct ibv_exp_
 		if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
 		{
 			dump_wqe(to_mctx(ibqp->context)->dbg_fp, idx, size, qp);
+
 			uint32_t *uninitialized_var(tmp_p);
 			uint64_t *uninitialized_var(tmp_pl);
 
-			fprintf(to_mctx(ibqp->context)->dbg_fp, "dump wqe swr_info #%d, wr_id=%lx, wqe size=%d, offset=%d\n", 
-				qp->cur_swr, qp->swr_info[qp->cur_swr].wr_id, size*2, qp->swr_info[qp->cur_swr].offset);
 			tmp_p=(uint32_t*)qp->swr_info[qp->cur_swr].ptr_to_size;
-			fprintf(fp, "Size ptr=%lx, Size=%d, + offset=%d\n", 
+			tmp_pl=(uint64_t*)qp->swr_info[qp->cur_swr].ptr_to_addr;
+
+			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Dump wqe swr_info #%d, wr_id=%lx, wqe size=%d, offset=%d\n", 
+				qp->cur_swr, qp->swr_info[qp->cur_swr].wr_id, size*2, qp->swr_info[qp->cur_swr].offset);
+			
+			tmp_p=(uint32_t*)qp->swr_info[qp->cur_swr].ptr_to_size;
+			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Size ptr=%lx, Size=%d, + offset=%d\n", 
 				(uintptr_t)qp->swr_info[qp->cur_swr].ptr_to_size, 
 				(int)ntohl(tmp_p[0]),
 				((int)ntohl(tmp_p[0]))+qp->swr_info[qp->cur_swr].offset );
 			
 			tmp_pl=(uint64_t*)qp->swr_info[qp->cur_swr].ptr_to_addr;
-			fprintf(fp, "Addr ptr=%lx, Addr=%lx - offset=%lx\n", 
+			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Addr ptr=%lx, Addr=%lx - offset=%lx\n", 
 				(uintptr_t)(qp->swr_info[qp->cur_swr].ptr_to_addr), 
 				((uintptr_t)ntohll(tmp_pl[0])),
 				(((uintptr_t)ntohll(tmp_pl[0])) - qp->swr_info[qp->cur_swr].offset) ) ;
 
 		}
 #endif
+		//We only use the first element. Does it make sense to treat this buffer as a circular buffer?
 		qp->cur_swr = (qp->cur_swr+1) % MLX5_QP_MAX_SWR_INFO;
 	}
 
@@ -2339,52 +2345,68 @@ post_send_no_db:
 	return err;
 }
 
-static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id) __attribute__((always_inline));
-static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id)
+static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id, struct ibv_qp_swr_info * swr_info) __attribute__((always_inline));
+static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id, struct ibv_qp_swr_info * swr_info)
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
-	int err = 0;
+	int ret=EINVAL;
+	uint32_t *uninitialized_var(size_p);
+	uint64_t *uninitialized_var(addr_p);
+
 #ifdef MLX5_DEBUG
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp;
 #endif
-	mlx5_lock(&qp->sq.lock);
-	uint32_t *uninitialized_var(tmp_p);
-	uint64_t *uninitialized_var(tmp_pl);
 
-#ifdef MLX5_DEBUG
-	fprintf(to_mctx(ibqp->context)->dbg_fp, "You asked for wr_id=%lx in qp=%p. Tot swr inqp=%d\n", 
-		wr_id, ibqp, qp->cur_swr);
+	if(!swr_info)
+		goto out;
+	
+	mlx5_lock(&qp->sq.lock);
+
+	mlx5_dbg(fp, MLX5_DBG_QP_SEND, "You asked for wr_id=%lx in qp=%p. Tot swr inqp=%d\n", wr_id, ibqp, qp->cur_swr);
 
 	for(int i=0; i < qp->cur_swr; i++)
 	{
 		if(qp->swr_info[i].wr_id == wr_id)
 		{
-			if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
-			{
-				fprintf(to_mctx(ibqp->context)->dbg_fp, "Found in index=%d, offset=%d\n", 
-						i, qp->swr_info[i].offset);
+			size_p=(uint32_t*)qp->swr_info[i].ptr_to_size;
+			addr_p=(uint64_t*)qp->swr_info[i].ptr_to_addr;
+			#ifdef MLX5_DEBUG
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Found in index=%d, offset=%d\n", i, qp->swr_info[i].offset);
+				
 
-				tmp_p=(uint32_t*)qp->swr_info[i].ptr_to_size;
-				fprintf(fp, "Size ptr=%lx, Size=%d, +offset=%d\n", 
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Size ptr=%lx, Size=%d, +offset=%d\n", 
 					(uintptr_t)qp->swr_info[i].ptr_to_size, 
-					(int)ntohl(tmp_p[0]),
-					((int)ntohl(tmp_p[0]))+qp->swr_info[i].offset );
-				tmp_pl=(uint64_t*)qp->swr_info[i].ptr_to_addr;
-				fprintf(fp, "Addr ptr=%lx, Addr=%lx -offset=%lx\n", 
+					(uint32_t)ntohl(size_p[0]),
+					((int)ntohl(size_p[0]))+qp->swr_info[i].offset );
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Addr ptr=%lx, Addr=%lx -offset=%lx\n", 
 					(uintptr_t)qp->swr_info[i].ptr_to_addr, 
-					(uintptr_t)ntohll(tmp_pl[0]),
-					((uintptr_t)ntohll(tmp_pl[0]))-qp->swr_info[i].offset );
-			}
-			//How can we return the infos?
+					(uintptr_t)ntohll(addr_p[0]),
+					((uintptr_t)ntohll(addr_p[0]))-qp->swr_info[i].offset );
+			#endif
+
+			swr_info->wr_id = qp->swr_info[i].wr_id;
+			
+			swr_info->ptr_to_size = qp->swr_info[i].ptr_to_size;
+			swr_info->val_size = (uint32_t)ntohl(size_p[0]);
+
+			swr_info->ptr_to_addr = qp->swr_info[i].ptr_to_addr;
+			swr_info->val_addr = (uint64_t)ntohll(addr_p[0]);
+
+			swr_info->offset = qp->swr_info[i].offset;
+			
 			//if found we should empty the buffer
-			//qp->cur_swr = 0;
+			qp->swr_info[i].wr_id=0;
+			qp->swr_info[i].ptr_to_size=0;
+			qp->swr_info[i].ptr_to_addr=0;
+			qp->cur_swr = 0;
+			ret=0;
+
 		}
 	}
-#endif
 
 	mlx5_unlock(&qp->sq.lock);
-
-	return err;
+out:
+	return ret;
 }
 /* =============================================================================================================== */
 
@@ -2507,9 +2529,9 @@ int mlx5_exp_post_send_info(struct ibv_qp *ibqp, struct ibv_exp_send_wr *wr,
 	return __mlx5_post_send_exp_info(ibqp, wr, bad_wr, 1);
 }
 
-int mlx5_exp_query_send_info(struct ibv_qp *ibqp, uint64_t wr_id)
+int mlx5_exp_query_send_info(struct ibv_qp *ibqp, uint64_t wr_id, struct ibv_qp_swr_info * swr_info)
 {
-	return __mlx5_query_send_exp_info(ibqp, wr_id);
+	return __mlx5_query_send_exp_info(ibqp, wr_id, swr_info);
 }
 
 int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
