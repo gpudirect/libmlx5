@@ -2340,11 +2340,7 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 				addr_p=(uint64_t*)qp->swr_info[i].sge[j].ptr_to_addr;
 
 				swr_info->sge_list[j].ptr_to_size = qp->swr_info[i].sge[j].ptr_to_size;
-				swr_info->sge_list[j].val_size = (uint32_t)ntohl(size_p[0]);
-
 				swr_info->sge_list[j].ptr_to_addr = qp->swr_info[i].sge[j].ptr_to_addr;
-				swr_info->sge_list[j].val_addr = (uint64_t)ntohll(addr_p[0]);
-
 				swr_info->sge_list[j].offset = qp->swr_info[i].sge[j].offset;
 				
 				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "SGE=%d, Size ptr=%lx, Size=%d, +offset=%d\n", 
