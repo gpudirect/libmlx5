@@ -795,13 +795,20 @@ enum mlx5_qp_flags {
 /* 
  * Expose send ptr and size
 */
-#define MLX5_QP_MAX_SWR_INFO 128
+#define MLX5_QP_EXP_SEND_MAX_SWR_INFO 128
+#define MLX5_QP_EXP_SEND_MAX_SGE 128
 
-struct mlx5_swr_info {
-	uint64_t wr_id;
+struct swr_sglist {
 	uintptr_t ptr_to_size;
 	uintptr_t ptr_to_addr;
 	int offset;
+};
+
+struct mlx5_swr_info {
+	uint64_t wr_id;
+	int cur_sge;
+	int num_sge;
+	struct swr_sglist sge[MLX5_QP_EXP_SEND_MAX_SGE];
 };
 
 struct mlx5_qp {
@@ -853,7 +860,7 @@ struct mlx5_qp {
 	/* Expose send params */
 	int 					save_swr_info;
 	int 					cur_swr;
-	struct mlx5_swr_info 			swr_info[MLX5_QP_MAX_SWR_INFO];
+	struct mlx5_swr_info 			swr_info[MLX5_QP_EXP_SEND_MAX_SWR_INFO];
 
 };
 
