@@ -2312,6 +2312,11 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 	if(!swr_info)
 		goto out;
 	
+	//Initial setup
+	swr_info->wr_id = 0;
+	swr_info->num_sge = 0;
+	swr_info->sge_list = NULL;
+
 	mlx5_lock(&qp->sq.lock);
 
 	mlx5_dbg(fp, MLX5_DBG_QP_SEND, "You asked for wr_id=%lx in qp=%p. Tot swr inqp=%d\n", wr_id, ibqp, qp->cur_swr);
