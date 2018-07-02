@@ -800,6 +800,7 @@ enum mlx5_qp_flags {
 
 struct swr_sglist {
 	uintptr_t ptr_to_size;
+	uintptr_t ptr_to_lkey;
 	uintptr_t ptr_to_addr;
 	int offset;
 };

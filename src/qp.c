@@ -641,6 +641,7 @@ static inline int set_data_non_inl_seg(struct mlx5_qp *qp, int num_sge, struct i
 			if(qp->save_swr_info == 1)
 			{
 				qp->swr_info[qp->cur_swr].sge[qp->swr_info[qp->cur_swr].cur_sge].ptr_to_size = (uintptr_t)(&(dpseg->byte_count));
+				qp->swr_info[qp->cur_swr].sge[qp->swr_info[qp->cur_swr].cur_sge].ptr_to_lkey = (uintptr_t)(&(dpseg->lkey));
 				qp->swr_info[qp->cur_swr].sge[qp->swr_info[qp->cur_swr].cur_sge].ptr_to_addr = (uintptr_t)(&(dpseg->addr));
 				qp->swr_info[qp->cur_swr].sge[qp->swr_info[qp->cur_swr].cur_sge].offset = offset;
 				if(qp->swr_info[qp->cur_swr].cur_sge < MLX5_QP_EXP_SEND_MAX_SGE)
@@ -2244,32 +2245,6 @@ static inline int __mlx5_post_send(struct ibv_qp *ibqp, struct ibv_exp_send_wr *
 		if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
 		{
 			dump_wqe(to_mctx(ibqp->context)->dbg_fp, idx, size, qp);
-			
-			#if 0
-			if(exp_send_flags & IBV_EXP_SEND_GET_INFO)
-			{
-				uint32_t *uninitialized_var(tmp_p);
-				uint64_t *uninitialized_var(tmp_pl);
-
-				tmp_p=(uint32_t*)qp->swr_info[qp->cur_swr].ptr_to_size;
-				tmp_pl=(uint64_t*)qp->swr_info[qp->cur_swr].ptr_to_addr;
-
-				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Dump wqe swr_info #%d, wr_id=%lx, wqe size=%d, offset=%d\n", 
-					qp->cur_swr, qp->swr_info[qp->cur_swr].wr_id, size*2, qp->swr_info[qp->cur_swr].offset);
-				
-				tmp_p=(uint32_t*)qp->swr_info[qp->cur_swr].ptr_to_size;
-				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Size ptr=%lx, Size=%d, + offset=%d\n", 
-					(uintptr_t)qp->swr_info[qp->cur_swr].ptr_to_size, 
-					(int)ntohl(tmp_p[0]),
-					((int)ntohl(tmp_p[0]))+qp->swr_info[qp->cur_swr].offset );
-				
-				tmp_pl=(uint64_t*)qp->swr_info[qp->cur_swr].ptr_to_addr;
-				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "Addr ptr=%lx, Addr=%lx - offset=%lx\n", 
-					(uintptr_t)(qp->swr_info[qp->cur_swr].ptr_to_addr), 
-					((uintptr_t)ntohll(tmp_pl[0])),
-					(((uintptr_t)ntohll(tmp_pl[0])) - qp->swr_info[qp->cur_swr].offset) ) ;
-			}
-			#endif
 		}
 #endif
 	}
@@ -2303,6 +2278,7 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	int ret=EINVAL;
 	uint32_t *uninitialized_var(size_p);
+	uint32_t *uninitialized_var(lkey_p);
 	uint64_t *uninitialized_var(addr_p);
 
 #ifdef MLX5_DEBUG
@@ -2342,9 +2318,11 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 			{
 				//Just for debug!
 				size_p=(uint32_t*)qp->swr_info[i].sge[j].ptr_to_size;
+				lkey_p=(uint32_t*)qp->swr_info[i].sge[j].ptr_to_lkey;
 				addr_p=(uint64_t*)qp->swr_info[i].sge[j].ptr_to_addr;
 
 				swr_info->sge_list[j].ptr_to_size = qp->swr_info[i].sge[j].ptr_to_size;
+				swr_info->sge_list[j].ptr_to_lkey = qp->swr_info[i].sge[j].ptr_to_lkey;
 				swr_info->sge_list[j].ptr_to_addr = qp->swr_info[i].sge[j].ptr_to_addr;
 				swr_info->sge_list[j].offset = qp->swr_info[i].sge[j].offset;
 				
@@ -2353,6 +2331,12 @@ static inline int __mlx5_query_send_exp_info(struct ibv_qp *ibqp, uint64_t wr_id
 					(uintptr_t)swr_info->sge_list[j].ptr_to_size, 
 					(uint32_t)ntohl(size_p[0]),
 					((int)ntohl(size_p[0]))+ swr_info->sge_list[j].offset );
+
+				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "SGE=%d, lkey ptr=%lx, lkey=%d\n", 
+					j,
+					(uintptr_t)swr_info->sge_list[j].ptr_to_lkey, 
+					(uint32_t)ntohl(lkey_p[0]));
+
 				mlx5_dbg(fp, MLX5_DBG_QP_SEND, "SGE=%d, Addr ptr=%lx, Addr=%lx -offset=%lx\n", 
 					j,
 					(uintptr_t)swr_info->sge_list[j].ptr_to_addr, 
