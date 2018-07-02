@@ -154,7 +154,7 @@ static inline struct mlx5_cqe64 *get_next_cqe(struct mlx5_cq *cq, const int cqe_
 		struct mlx5_peek_entry *tmp;
 
 		while (cq->peer_peek_table[idx]) {
-			if (cq->peer_peek_table[idx]->busy) {
+			if (READ_ONCE(cq->peer_peek_table[idx]->busy)) {
 				errno = EBUSY;
 				return NULL;
 			}
@@ -1267,7 +1267,7 @@ int mlx5_exp_peer_abort_peek_cq(struct ibv_cq *ibcq,
 	if (!cq->peer_enabled)
 		return EINVAL;
 
-	((struct mlx5_peek_entry *)(uintptr_t)peek_ctx->peek_id)->busy = 0;
+	WRITE_ONCE(((struct mlx5_peek_entry *)(uintptr_t)peek_ctx->peek_id)->busy, 0);
 	return 0;
 }
 

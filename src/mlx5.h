@@ -125,6 +125,14 @@
 
 #define HIDDEN		__attribute__((visibility("hidden")))
 
+#ifndef READ_ONCE 
+#define READ_ONCE(x)  (*((volatile typeof(x) *)&(x)))
+#endif
+
+#ifndef WRITE_ONCE 
+#define WRITE_ONCE(x,v)  do { (*((volatile typeof(x) *)&(x))) = (v); } while(0)
+#endif
+
 #define PFX		"mlx5: "
 
 #define MLX5_MAX_PORTS_NUM	2

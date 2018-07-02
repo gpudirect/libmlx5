@@ -4184,7 +4184,6 @@ struct __mlx5_clock_info_v1 {
 	__u64 mask;
 };
 
-#define READ_ONCE(x)  (*((volatile typeof(x) *)&(x)))
 static int mlx5_get_clock_info(struct ibv_context *context,
 			       struct ibv_exp_clock_info *clock_info)
 {
